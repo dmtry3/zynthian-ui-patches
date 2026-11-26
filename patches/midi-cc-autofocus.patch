@@ -89,13 +89,13 @@ diff --git a/zyngui/zynthian_gui_config.py b/zyngui/zynthian_gui_config.py
 index ab3b5c0..ca11a3a 100644
 --- a/zyngui/zynthian_gui_config.py
 +++ b/zyngui/zynthian_gui_config.py
-@@ -605,6 +605,7 @@ control_test_enabled = get_env_int('ZYNTHIAN_UI_CONTROL_TEST_ENABLED', 0)
+@@ -604,5 +604,6 @@
+ control_test_enabled = get_env_int('ZYNTHIAN_UI_CONTROL_TEST_ENABLED', 0)
  power_save_secs = 60 * get_env_int('ZYNTHIAN_UI_POWER_SAVE_MINUTES', 60)
  audio_power_threshold = get_env_int('ZYNTHIAN_UI_AUDIO_POWER_THRESHOLD', -40)
- preset_preload = get_env_int('ZYNTHIAN_UI_PRESET_PRELOAD', 1)
 +midi_cc_autofocus = get_env_int('ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS', 1)
+ preset_preload = get_env_int('ZYNTHIAN_UI_PRESET_PRELOAD', 1)
  mixer_toggle = os.environ.get('ZYNTHIAN_UI_MIXER_TOGGLE', "record")
- main_menu_columns = get_env_int('ZYNTHIAN_UI_MAIN_MENU_COLUMNS', 0)
  
 diff --git a/zyngui/zynthian_gui_control.py b/zyngui/zynthian_gui_control.py
 index e391b3b..6794d13 100644

@@ -65,12 +65,15 @@ fi
 
 cd "${ZYNTHIAN_UI_DIR}"
 
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+CURRENT_BRANCH="$(git branch --show-current 2>/dev/null || true)"
+if [[ -z "${CURRENT_BRANCH}" ]]; then
+    CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+fi
 CURRENT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 echo "Target: ${ZYNTHIAN_UI_DIR} (branch: ${CURRENT_BRANCH}, commit: ${CURRENT_COMMIT})"
 
-if [[ "${CURRENT_BRANCH}" != "vangelis" && "${CURRENT_BRANCH}" != "unknown" ]]; then
-    echo "Warning: expected zynthian-ui branch 'vangelis', found '${CURRENT_BRANCH}'." >&2
+if [[ "${CURRENT_BRANCH}" != vangelis* && "${CURRENT_BRANCH}" != "unknown" ]]; then
+    echo "Warning: expected a 'vangelis' branch of zynthian-ui, found '${CURRENT_BRANCH}'." >&2
 fi
 
 if [[ "${STATUS}" -eq 1 ]]; then
