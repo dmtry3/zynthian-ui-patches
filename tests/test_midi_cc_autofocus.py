@@ -24,6 +24,7 @@ def install_stubs():
     zynauto_mod = types.ModuleType("zynautoconnect")
     zynauto_mod.ctrl_fb_procs = []
     zynauto_mod.get_midi_in_devid = MagicMock(return_value="USB_MIDI")
+    zynauto_mod.get_midi_in_dev_mode = MagicMock(return_value=1)
     zynauto_mod.request_audio_connect = MagicMock()
     zynauto_mod.request_midi_connect = MagicMock()
     sys.modules["zynautoconnect"] = zynauto_mod
@@ -92,6 +93,7 @@ def install_stubs():
 install_stubs()
 
 import zynconf  # noqa: E402
+import zynautoconnect  # noqa: E402
 from zyngui import zynthian_gui_config  # noqa: E402
 from zyngui.zynthian_gui_control import (  # noqa: E402
     MIDI_LEARNING_CHAIN,
@@ -118,6 +120,7 @@ def load_chain_manager_method():
                     ns = {
                         "MAX_NUM_MIDI_DEVS": 16,
                         "zynthian_gui_config": zynthian_gui_config,
+                        "zynautoconnect": zynautoconnect,
                     }
                     exec(compile(mod, path, "exec"), ns)
                     return ns["get_midi_cc_zctrls"]
@@ -138,6 +141,10 @@ class FakeZCtrl:
         self.is_toggle = False
         self.midi_cc_mode = 0
         self.range_reversed = False
+        self.midi_cc_calls = []
+
+    def midi_control_change(self, val, send=True):
+        self.midi_cc_calls.append(val)
 
 
 class FakeProcessor:
@@ -164,10 +171,11 @@ class FakeProcessor:
 
 
 class FakeChain:
-    def __init__(self, chain_id, processors=None, zctrls=None):
+    def __init__(self, chain_id, processors=None, zctrls=None, midi_chan=None):
         self.chain_id = chain_id
         self.processors = processors or []
         self.zctrls = zctrls or []
+        self.midi_chan = midi_chan
         self.current_processor = self.processors[0] if self.processors else None
 
     def set_current_processor(self, proc):
@@ -244,17 +252,19 @@ def make_control_screen(chain_manager, zyngui, parent=None, list_data=None, zcon
 class TestMidiCCAutoFocus(unittest.TestCase):
     def setUp(self):
         zynconf.save_config.reset_mock()
+        zynautoconnect.get_midi_in_dev_mode.reset_mock()
+        zynautoconnect.get_midi_in_dev_mode.return_value = 1  # ACTI default
         zynthian_gui_config.midi_cc_autofocus = 1
         zynthian_gui_config.midi_bank_change = 0
 
-        # Chain 1: Synth (2 pages) + Reverb FX (2 pages)
+        # Chain 1: Synth (2 pages) + Reverb FX (2 pages) on MIDI CH 1 (0)
         self.z1_p0 = FakeZCtrl("cutoff")
         self.z1_p1 = FakeZCtrl("resonance")
         self.z1_fx_p0 = FakeZCtrl("dry_wet")
         self.z1_fx_p1 = FakeZCtrl("decay")
         self.z1_chain_only = FakeZCtrl("fav_only")
 
-        self.chain1 = FakeChain(1)
+        self.chain1 = FakeChain(1, midi_chan=0)
         self.proc1_synth = FakeProcessor(
             1, "Synth1", 1, {"Page1": [self.z1_p0], "Page2": [self.z1_p1]}, chain=self.chain1
         )
@@ -269,10 +279,10 @@ class TestMidiCCAutoFocus(unittest.TestCase):
         self.chain1.processors = [self.proc1_synth, self.proc1_fx]
         self.chain1.current_processor = self.proc1_synth
 
-        # Chain 2: Synth2 (2 pages)
+        # Chain 2: Synth2 (2 pages) on MIDI CH 2 (1)
         self.z2_p0 = FakeZCtrl("osc_tune")
         self.z2_p1 = FakeZCtrl("env_attack")
-        self.chain2 = FakeChain(2)
+        self.chain2 = FakeChain(2, midi_chan=1)
         self.proc2_synth = FakeProcessor(
             3, "Synth2", 2, {"Osc": [self.z2_p0], "Env": [self.z2_p1]}, chain=self.chain2
         )
@@ -291,6 +301,8 @@ class TestMidiCCAutoFocus(unittest.TestCase):
         self.z_alsa_p1.processor = self.proc_alsa
 
         self.cm = FakeChainManager({1: self.chain1, 2: self.chain2}, self.chain1)
+        self.cm._midi_chan_2_chain_ids[0] = [1]
+        self.cm._midi_chan_2_chain_ids[1] = [2]
 
         self.state_manager = MagicMock()
         self.state_manager.is_busy.return_value = False
@@ -369,6 +381,93 @@ class TestMidiCCAutoFocus(unittest.TestCase):
         self.ctrl.cb_midi_cc(izmip=2, chan=0, num=10, val=85)
         self.assertEqual(self.cm.set_active_chain_calls, [2])
         self.assertEqual(self.ctrl.selected_indices, [])
+        # Global binding is already delivered by chain_manager.midi_control_change -> never double-applied
+        self.assertEqual(self.z2_p1.midi_cc_calls, [])
+
+    def test_cross_chain_chain_learn_switches_chain_from_any_chain_and_applies_first_tick(self):
+        # Default Chain MIDI Learn on Chain 2 (ch=0, cc=22) while user is viewing Chain 1 in control mode
+        key = (2 << 16) | (0 << 8) | 22
+        self.cm.chain_midi_cc_binding[key] = [self.z2_p1]
+
+        self.ctrl.cb_midi_cc(izmip=0, chan=0, num=22, val=90)
+
+        self.assertEqual(self.cm.set_active_chain_calls, [2])
+        self.assertEqual(self.chain2.current_processor, self.proc2_synth)
+        self.assertEqual(self.proc2_synth.current_screen_index, 1)
+        self.assertIsNone(self.parent.chain_canvas.selected_index)
+        # First tick was missed by chain_manager.midi_control_change before switch -> delivered once
+        self.assertEqual(self.z2_p1.midi_cc_calls, [90])
+
+        # Rapid second tick while active_chain is already 2 -> must NOT double-deliver
+        self.ctrl.cb_midi_cc(izmip=0, chan=0, num=22, val=95)
+        self.assertEqual(self.cm.set_active_chain_calls, [2])
+        self.assertEqual(self.z2_p1.midi_cc_calls, [90])
+
+    def test_active_chain_explicit_chain_learn_keeps_priority_over_other_chain(self):
+        # Same (ch=0, cc=22) explicitly Chain-learned on BOTH Chain 1 and Chain 2 -> stays on active Chain 1
+        self.cm.chain_midi_cc_binding[(1 << 16) | (0 << 8) | 22] = [self.z1_fx_p1]
+        self.cm.chain_midi_cc_binding[(2 << 16) | (0 << 8) | 22] = [self.z2_p1]
+
+        self.ctrl.cb_midi_cc(izmip=0, chan=0, num=22, val=64)
+
+        self.assertEqual(self.cm.set_active_chain_calls, [])
+        self.assertEqual(self.ctrl.selected_indices, [5])
+        self.assertEqual(self.z1_fx_p1.midi_cc_calls, [])
+        self.assertEqual(self.z2_p1.midi_cc_calls, [])
+
+    def test_explicit_other_chain_learn_and_global_learn_beat_visible_active_autolearn(self):
+        # Chain 1 has visible auto-learned (0xFF) CC 74 on z1_p0
+        self.cm.chain_midi_cc_binding[(1 << 16) | (0xFF << 8) | 74] = [self.z1_p0]
+        # Chain 2 has explicit Chain Learn on CH 2 (chan=1), CC 74 -> z2_p1
+        self.cm.chain_midi_cc_binding[(2 << 16) | (1 << 8) | 74] = [self.z2_p1]
+
+        self.ctrl.cb_midi_cc(izmip=0, chan=1, num=74, val=100)
+
+        self.assertEqual(self.cm.set_active_chain_calls, [2])
+        self.assertEqual(self.proc2_synth.current_screen_index, 1)
+        self.assertEqual(self.z2_p1.midi_cc_calls, [100])
+
+        # Reset to Chain 1 and verify Global Learn also beats visible active-chain auto-learn
+        self.cm.active_chain = self.chain1
+        self.cm.set_active_chain_calls.clear()
+        self.z2_p1.midi_cc_calls.clear()
+        self.cm.absolute_midi_cc_binding[(0 << 16) | (0 << 8) | 74] = [self.z2_p1]
+
+        self.ctrl.cb_midi_cc(izmip=0, chan=0, num=74, val=110)
+
+        self.assertEqual(self.cm.set_active_chain_calls, [2])
+        self.assertEqual(self.z2_p1.midi_cc_calls, [])
+
+    def test_multi_mode_unbound_cc_switches_to_target_midi_channel_chain(self):
+        # MULTI mode (0): both chains have engine auto-learned CC 74 (0xFF)
+        zynautoconnect.get_midi_in_dev_mode.return_value = 0
+        self.cm.chain_midi_cc_binding[(1 << 16) | (0xFF << 8) | 74] = [self.z1_p0]
+        self.cm.chain_midi_cc_binding[(2 << 16) | (0xFF << 8) | 74] = [self.z2_p1]
+
+        # Viewing Chain 1 (CH 1), receive CC 74 on CH 2 (chan=1) -> switches to Chain 2
+        self.ctrl.cb_midi_cc(izmip=0, chan=1, num=74, val=77)
+
+        self.assertEqual(self.cm.set_active_chain_calls, [2])
+        self.assertEqual(self.proc2_synth.current_screen_index, 1)
+        self.assertEqual(self.z2_p1.midi_cc_calls, [77])
+
+    def test_acti_mode_unbound_cc_prefers_active_chain_but_falls_back_to_channel_chain(self):
+        # ACTI mode (1): if active chain has 0xFF CC 74, stay on active chain
+        zynautoconnect.get_midi_in_dev_mode.return_value = 1
+        self.cm.chain_midi_cc_binding[(1 << 16) | (0xFF << 8) | 74] = [self.z1_p1]
+        self.cm.chain_midi_cc_binding[(2 << 16) | (0xFF << 8) | 74] = [self.z2_p1]
+
+        self.ctrl.cb_midi_cc(izmip=0, chan=1, num=74, val=50)
+        self.assertEqual(self.cm.set_active_chain_calls, [])
+        self.assertEqual(self.ctrl.selected_indices, [2])
+
+        # If active chain does NOT have 0xFF CC 71, fall back to chain assigned to incoming midi_chan (Chain 2)
+        self.cm.chain_midi_cc_binding[(2 << 16) | (0xFF << 8) | 71] = [self.z2_p1]
+
+        self.ctrl.cb_midi_cc(izmip=0, chan=1, num=71, val=88)
+        self.assertEqual(self.cm.set_active_chain_calls, [2])
+        self.assertEqual(self.proc2_synth.current_screen_index, 1)
+        self.assertEqual(self.z2_p1.midi_cc_calls, [88])
 
     def test_already_visible_control_is_noop(self):
         # z1_p0 is already in self.ctrl.zcontrollers

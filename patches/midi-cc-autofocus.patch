@@ -1,8 +1,8 @@
 diff --git a/zyngine/zynthian_chain_manager.py b/zyngine/zynthian_chain_manager.py
-index 8d483f4..4ad287e 100644
+index 8d483f4..fdd6f32 100644
 --- a/zyngine/zynthian_chain_manager.py
 +++ b/zyngine/zynthian_chain_manager.py
-@@ -1793,6 +1793,44 @@ class zynthian_chain_manager:
+@@ -1793,6 +1793,105 @@ class zynthian_chain_manager:
          except:
              return None
  
@@ -12,7 +12,7 @@ index 8d483f4..4ad287e 100644
 +        zmip : Index of MIDI input device
 +        midi_chan : MIDI channel
 +        cc_num : CC number
-+        Returns : List of bound zynthian_controller objects (absolute bindings first, then active chain)
++        Returns : List of bound zynthian_controller objects from the highest-priority matching binding tier
 +        """
 +        if zmip is None or zmip < 0 or zmip >= MAX_NUM_MIDI_DEVS:
 +            return []
@@ -21,28 +21,89 @@ index 8d483f4..4ad287e 100644
 +            if 0 <= midi_chan < len(self._midi_chan_2_chain_ids) and self._midi_chan_2_chain_ids[midi_chan]:
 +                return []
 +
-+        zctrls = []
 +        key_low = (midi_chan << 8) | cc_num
 +
-+        # Absolute / Global CC bindings
++        # 1. Absolute / Global CC bindings
 +        key = (zmip << 16) | key_low
-+        if key in self.absolute_midi_cc_binding:
-+            zctrls.extend(self.absolute_midi_cc_binding[key])
++        if key in self.absolute_midi_cc_binding and self.absolute_midi_cc_binding[key]:
++            return list(self.absolute_midi_cc_binding[key])
 +
-+        # Active chain CC bindings (channel-bound and channel-unbound)
-+        if self.active_chain is not None:
-+            key = (self.active_chain.chain_id << 16) | key_low
++        active_chain_id = self.active_chain.chain_id if self.active_chain is not None else None
++        chan_chain_ids = (
++            self._midi_chan_2_chain_ids[midi_chan]
++            if 0 <= midi_chan < len(self._midi_chan_2_chain_ids)
++            else []
++        )
++
++        # 2. Active chain channel-bound CC bindings
++        if active_chain_id is not None:
++            key = (active_chain_id << 16) | key_low
++            if key in self.chain_midi_cc_binding and self.chain_midi_cc_binding[key]:
++                return list(self.chain_midi_cc_binding[key])
++
++        # 3. Other chains' channel-bound CC bindings (prefer chains assigned to midi_chan first)
++        zctrls = []
++        checked_chains = {active_chain_id} if active_chain_id is not None else set()
++        for cid in list(chan_chain_ids) + list(self.chains.keys()):
++            if cid in checked_chains or cid not in self.chains:
++                continue
++            checked_chains.add(cid)
++            key = (cid << 16) | key_low
 +            if key in self.chain_midi_cc_binding:
 +                for zctrl in self.chain_midi_cc_binding[key]:
 +                    if zctrl not in zctrls:
 +                        zctrls.append(zctrl)
-+            key = (self.active_chain.chain_id << 16) | (0xff << 8) | cc_num
-+            if key in self.chain_midi_cc_binding:
-+                for zctrl in self.chain_midi_cc_binding[key]:
-+                    if zctrl not in zctrls:
-+                        zctrls.append(zctrl)
++        if zctrls:
++            return zctrls
 +
-+        return zctrls
++        # 4. Channel-unbound (0xFF) CC bindings (e.g. engine auto-learned CCs)
++        dev_mode = zynautoconnect.get_midi_in_dev_mode(zmip)
++        all_chan_chain_ids = [
++            cid for cid, ch in self.chains.items()
++            if getattr(ch, "midi_chan", None) is not None and ch.midi_chan >= 16
++        ]
++
++        if dev_mode == 0:
++            # MULTI mode: prioritize chains on incoming midi_chan (active chain first if on midi_chan),
++            # then CH#ALL chains, then active chain fallback
++            candidate_groups = []
++            if chan_chain_ids:
++                ordered = [cid for cid in chan_chain_ids if cid == active_chain_id]
++                ordered += [cid for cid in chan_chain_ids if cid != active_chain_id]
++                candidate_groups.append(ordered)
++            if all_chan_chain_ids:
++                ordered = [cid for cid in all_chan_chain_ids if cid == active_chain_id]
++                ordered += [cid for cid in all_chan_chain_ids if cid != active_chain_id]
++                candidate_groups.append(ordered)
++            if active_chain_id is not None:
++                candidate_groups.append([active_chain_id])
++        else:
++            # ACTI mode: prioritize active chain, then chains on incoming midi_chan, then CH#ALL chains
++            candidate_groups = []
++            if active_chain_id is not None:
++                candidate_groups.append([active_chain_id])
++            if chan_chain_ids:
++                candidate_groups.append(list(chan_chain_ids))
++            if all_chan_chain_ids:
++                candidate_groups.append(all_chan_chain_ids)
++
++        key_unbound_low = (0xff << 8) | cc_num
++        checked_chains = set()
++        for group in candidate_groups:
++            group_zctrls = []
++            for cid in group:
++                if cid in checked_chains or cid not in self.chains:
++                    continue
++                checked_chains.add(cid)
++                key = (cid << 16) | key_unbound_low
++                if key in self.chain_midi_cc_binding:
++                    for zctrl in self.chain_midi_cc_binding[key]:
++                        if zctrl not in group_zctrls:
++                            group_zctrls.append(zctrl)
++            if group_zctrls:
++                return group_zctrls
++
++        return []
 +
      def midi_control_change(self, zmip, midi_chan, cc_num, cc_val):
          """Send MIDI CC message to relevant chain
@@ -98,7 +159,7 @@ index ab3b5c0..ca11a3a 100644
  mixer_toggle = os.environ.get('ZYNTHIAN_UI_MIXER_TOGGLE', "record")
  
 diff --git a/zyngui/zynthian_gui_control.py b/zyngui/zynthian_gui_control.py
-index e391b3b..6794d13 100644
+index e391b3b..a9a0c1f 100644
 --- a/zyngui/zynthian_gui_control.py
 +++ b/zyngui/zynthian_gui_control.py
 @@ -28,6 +28,7 @@ import importlib
@@ -109,7 +170,7 @@ index e391b3b..6794d13 100644
  import zynautoconnect
  from zyngine.zynthian_signal_manager import zynsigman
  from zyngui import zynthian_gui_config
-@@ -738,11 +739,162 @@ class zynthian_gui_control(zynthian_gui_selector):
+@@ -738,11 +739,175 @@ class zynthian_gui_control(zynthian_gui_selector):
          val : CC value
          """
  
@@ -127,14 +188,14 @@ index e391b3b..6794d13 100644
 +            return
 +
 +        if zynthian_gui_config.midi_cc_autofocus and num < 120:
-+            self.midi_cc_autofocus(izmip, chan, num)
++            self.midi_cc_autofocus(izmip, chan, num, val)
 +
 +    def toggle_midi_cc_autofocus(self):
 +        zynthian_gui_config.midi_cc_autofocus = int(not zynthian_gui_config.midi_cc_autofocus)
 +        zynconf.save_config({"ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS": str(zynthian_gui_config.midi_cc_autofocus)})
 +        logging.info(f"MIDI CC Auto-Focus {'ON' if zynthian_gui_config.midi_cc_autofocus else 'OFF'}")
 +
-+    def midi_cc_autofocus(self, izmip, chan, num):
++    def midi_cc_autofocus(self, izmip, chan, num, val=None):
 +        """Auto-focus processor and control page for a mapped MIDI CC when Control screen is active"""
 +
 +        if not self.shown or self.mode != 'control':
@@ -160,8 +221,21 @@ index e391b3b..6794d13 100644
 +        if any(zctrl in self.zcontrollers for zctrl in zctrls):
 +            return
 +
++        old_active_chain_id = self.chain_manager.active_chain.chain_id if self.chain_manager.active_chain else None
++        abs_key = (izmip << 16) | (chan << 8) | num
++        abs_zctrls = self.chain_manager.absolute_midi_cc_binding.get(abs_key, ())
++
 +        for zctrl in zctrls:
 +            if self.focus_zctrl(zctrl):
++                # Deliver the initial CC tick when switching chains for a non-active chain binding
++                # (chain_manager.midi_control_change only processes active_chain and absolute bindings)
++                if val is not None and zctrl not in abs_zctrls:
++                    proc = getattr(zctrl, "processor", None)
++                    target_chain_id = getattr(proc, "chain_id", None)
++                    if target_chain_id is not None and target_chain_id != old_active_chain_id:
++                        for z in zctrls:
++                            if z not in abs_zctrls and getattr(getattr(z, "processor", None), "chain_id", None) == target_chain_id:
++                                z.midi_control_change(val)
 +                return
 +
 +    def find_zctrl_page(self, zctrl):
@@ -277,7 +351,7 @@ index e391b3b..6794d13 100644
  
      def midi_unlearn(self, param=None):
          if param:
-@@ -850,6 +1002,10 @@ class zynthian_gui_control(zynthian_gui_selector):
+@@ -850,6 +1015,10 @@ class zynthian_gui_control(zynthian_gui_selector):
                  else:
                      ccnum = "NONE"
                  options[f"ZynStep CC [{ccnum}]"] = i
@@ -288,7 +362,7 @@ index e391b3b..6794d13 100644
              else:
                  title = "Control unlearn"
  
-@@ -883,6 +1039,9 @@ class zynthian_gui_control(zynthian_gui_selector):
+@@ -883,6 +1052,9 @@ class zynthian_gui_control(zynthian_gui_selector):
              if self.processors[0].chain:
                  self.processors[0].chain.toggle_zctrl(param)
                  self.update_list()
