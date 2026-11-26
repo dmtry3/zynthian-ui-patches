@@ -33,7 +33,7 @@
 curl -fsSL https://raw.githubusercontent.com/dmtry3/zynthian-ui-patches/main/install.sh | bash
 ```
 
-Скрипт склонирует репозиторий в `/root/zynthian-ui-patches` (или обновит, если уже склонирован), применит патч к `/zynthian/zynthian-ui`, проверит синтаксис Python и перезапустит сервис `zynthian`.
+Скрипт склонирует репозиторий в `/root/zynthian-ui-patches` (или обновит, если уже склонирован), настроит авто-применение патча через systemd drop-in (`/etc/systemd/system/zynthian.service.d/zynthian-ui-patches.conf`), применит патч к `/zynthian/zynthian-ui`, проверит синтаксис Python и перезапустит сервис `zynthian`.
 
 ### Установка через `git clone`
 
@@ -43,21 +43,34 @@ cd /root/zynthian-ui-patches
 ./install.sh
 ```
 
+## Авто-сохранение после обновлений Zynthian
+
+При обновлении `update_zynthian.sh` выполняет `git checkout .` в `/zynthian/zynthian-ui` и перезапускает `zynthian.service`.
+Установщик автоматически создаёт systemd drop-in `/etc/systemd/system/zynthian.service.d/zynthian-ui-patches.conf`:
+
+```ini
+[Service]
+ExecStartPre=-/root/zynthian-ui-patches/install.sh --no-restart --no-hook --zynthian-ui-dir /zynthian/zynthian-ui
+```
+
+- `update_zynthian_sys.sh` перезаписывает только `zynthian.service` и не трогает `zynthian.service.d/`.
+- Перед каждым запуском `zynthian.service` патч проверяется и при необходимости автоматически накатывается обратно.
+- Префикс `-` гарантирует, что при конфликте в будущем релизе Zynthian сервис всё равно запустится со стоковым UI.
+- Для установки без systemd drop-in используйте `./install.sh --no-hook`.
+
 ## Проверка статуса и откат патча
 
-Проверить, установлен ли патч:
+Проверить статус патча и systemd-хука:
 
 ```bash
 /root/zynthian-ui-patches/install.sh --status
 ```
 
-Откатить патч (например, перед обновлением Zynthian):
+Полностью удалить хук и откатить патч:
 
 ```bash
 /root/zynthian-ui-patches/install.sh --revert
 ```
-
-> Примечание: перед `update_zynthian.sh` рекомендуется откатить патч (`./install.sh --revert`), обновиться и снова применить его (`./install.sh`).
 
 ## Проверка тестами
 
