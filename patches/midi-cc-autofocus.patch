@@ -1,0 +1,300 @@
+diff --git a/zyngine/zynthian_chain_manager.py b/zyngine/zynthian_chain_manager.py
+index 8d483f4..4ad287e 100644
+--- a/zyngine/zynthian_chain_manager.py
++++ b/zyngine/zynthian_chain_manager.py
+@@ -1793,6 +1793,44 @@ class zynthian_chain_manager:
+         except:
+             return None
+ 
++    def get_midi_cc_zctrls(self, zmip, midi_chan, cc_num):
++        """Get list of zctrls bound to an external MIDI CC message
++
++        zmip : Index of MIDI input device
++        midi_chan : MIDI channel
++        cc_num : CC number
++        Returns : List of bound zynthian_controller objects (absolute bindings first, then active chain)
++        """
++        if zmip is None or zmip < 0 or zmip >= MAX_NUM_MIDI_DEVS:
++            return []
++
++        if zynthian_gui_config.midi_bank_change and cc_num in (0, 32):
++            if 0 <= midi_chan < len(self._midi_chan_2_chain_ids) and self._midi_chan_2_chain_ids[midi_chan]:
++                return []
++
++        zctrls = []
++        key_low = (midi_chan << 8) | cc_num
++
++        # Absolute / Global CC bindings
++        key = (zmip << 16) | key_low
++        if key in self.absolute_midi_cc_binding:
++            zctrls.extend(self.absolute_midi_cc_binding[key])
++
++        # Active chain CC bindings (channel-bound and channel-unbound)
++        if self.active_chain is not None:
++            key = (self.active_chain.chain_id << 16) | key_low
++            if key in self.chain_midi_cc_binding:
++                for zctrl in self.chain_midi_cc_binding[key]:
++                    if zctrl not in zctrls:
++                        zctrls.append(zctrl)
++            key = (self.active_chain.chain_id << 16) | (0xff << 8) | cc_num
++            if key in self.chain_midi_cc_binding:
++                for zctrl in self.chain_midi_cc_binding[key]:
++                    if zctrl not in zctrls:
++                        zctrls.append(zctrl)
++
++        return zctrls
++
+     def midi_control_change(self, zmip, midi_chan, cc_num, cc_val):
+         """Send MIDI CC message to relevant chain
+ 
+diff --git a/zyngui/zynthian_gui_chain_options.py b/zyngui/zynthian_gui_chain_options.py
+index 6534ccf..35814e3 100644
+--- a/zyngui/zynthian_gui_chain_options.py
++++ b/zyngui/zynthian_gui_chain_options.py
+@@ -27,6 +27,7 @@ import logging
+ import os
+ 
+ # Zynthian specific modules
++import zynconf
+ import zynautoconnect
+ from zyngui import zynthian_gui_config
+ from zyngui.zynthian_gui_selector_info import zynthian_gui_selector_info
+@@ -87,6 +88,12 @@ class zynthian_gui_chain_options(zynthian_gui_selector_info):
+         if self.chain.get_processor_count():
+             self.list_data.append((self.clear_midi_learn, None, "Clean MIDI Learn",
+                                    ["Remove CC bindings from all parameters of all processors in this chain.", "delete_presets.png"]))
++        if zynthian_gui_config.midi_cc_autofocus:
++            title = "\u2612 MIDI Auto-Focus"
++        else:
++            title = "\u2610 MIDI Auto-Focus"
++        self.list_data.append((self.toggle_midi_cc_autofocus, None, title,
++                               ["Automatically switch to the mapped processor and control page when turning a MIDI-mapped controller knob.", "midi_learn.png"]))
+         if len(self.list_data) == len_check:
+             self.list_data.pop() # Remove section title for empty section
+ 
+@@ -136,6 +143,12 @@ class zynthian_gui_chain_options(zynthian_gui_selector_info):
+             self.zyngui.chain_manager.clean_midi_learn,
+             self.chain.chain_id)
+ 
++    def toggle_midi_cc_autofocus(self):
++        zynthian_gui_config.midi_cc_autofocus = int(not zynthian_gui_config.midi_cc_autofocus)
++        zynconf.save_config({"ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS": str(zynthian_gui_config.midi_cc_autofocus)})
++        logging.info(f"MIDI CC Auto-Focus {'ON' if zynthian_gui_config.midi_cc_autofocus else 'OFF'}")
++        self.update_list()
++
+     def move_chain(self):
+         if self.parent:
+             self.zyngui.show_screen('chain_manager')
+diff --git a/zyngui/zynthian_gui_config.py b/zyngui/zynthian_gui_config.py
+index ab3b5c0..ca11a3a 100644
+--- a/zyngui/zynthian_gui_config.py
++++ b/zyngui/zynthian_gui_config.py
+@@ -605,6 +605,7 @@ control_test_enabled = get_env_int('ZYNTHIAN_UI_CONTROL_TEST_ENABLED', 0)
+ power_save_secs = 60 * get_env_int('ZYNTHIAN_UI_POWER_SAVE_MINUTES', 60)
+ audio_power_threshold = get_env_int('ZYNTHIAN_UI_AUDIO_POWER_THRESHOLD', -40)
+ preset_preload = get_env_int('ZYNTHIAN_UI_PRESET_PRELOAD', 1)
++midi_cc_autofocus = get_env_int('ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS', 1)
+ mixer_toggle = os.environ.get('ZYNTHIAN_UI_MIXER_TOGGLE', "record")
+ main_menu_columns = get_env_int('ZYNTHIAN_UI_MAIN_MENU_COLUMNS', 0)
+ 
+diff --git a/zyngui/zynthian_gui_control.py b/zyngui/zynthian_gui_control.py
+index e391b3b..6794d13 100644
+--- a/zyngui/zynthian_gui_control.py
++++ b/zyngui/zynthian_gui_control.py
+@@ -28,6 +28,7 @@ import importlib
+ from pathlib import Path
+ 
+ # Zynthian specific modules
++import zynconf
+ import zynautoconnect
+ from zyngine.zynthian_signal_manager import zynsigman
+ from zyngui import zynthian_gui_config
+@@ -738,11 +739,162 @@ class zynthian_gui_control(zynthian_gui_selector):
+         val : CC value
+         """
+ 
+-        if self.midi_learning and self.zyngui.state_manager.midi_learn_zctrl and num < 120:
+-            # Handle MIDI learn for assignable CC
+-            # TODO Detect CC relative mode, etc.
+-            self.midi_learn_bind(izmip, chan, num)
+-            #self.zyngui.show_current_screen()
++        if self.midi_learning:
++            if self.zyngui.state_manager.midi_learn_zctrl and num < 120:
++                # Handle MIDI learn for assignable CC
++                # TODO Detect CC relative mode, etc.
++                self.midi_learn_bind(izmip, chan, num)
++                #self.zyngui.show_current_screen()
++            return
++
++        if zynthian_gui_config.midi_cc_autofocus and num < 120:
++            self.midi_cc_autofocus(izmip, chan, num)
++
++    def toggle_midi_cc_autofocus(self):
++        zynthian_gui_config.midi_cc_autofocus = int(not zynthian_gui_config.midi_cc_autofocus)
++        zynconf.save_config({"ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS": str(zynthian_gui_config.midi_cc_autofocus)})
++        logging.info(f"MIDI CC Auto-Focus {'ON' if zynthian_gui_config.midi_cc_autofocus else 'OFF'}")
++
++    def midi_cc_autofocus(self, izmip, chan, num):
++        """Auto-focus processor and control page for a mapped MIDI CC when Control screen is active"""
++
++        if not self.shown or self.mode != 'control':
++            return
++        if self.zyngui.state_manager.is_busy():
++            return
++        if izmip is None or izmip < 0 or izmip >= self.zyngui.state_manager.get_max_num_midi_devs():
++            return
++
++        # Only trigger when the Control screen is already open
++        cur_screen = self.zyngui.current_screen
++        if self.parent:
++            if cur_screen != "chain_control" or self.parent.subscreen is not self:
++                return
++        elif cur_screen not in ("control", "alsa_mixer", "audio_player", "tempo"):
++            return
++
++        zctrls = self.chain_manager.get_midi_cc_zctrls(izmip, chan, num)
++        if not zctrls:
++            return
++
++        # Already displaying one of the mapped controls on the current encoder page
++        if any(zctrl in self.zcontrollers for zctrl in zctrls):
++            return
++
++        for zctrl in zctrls:
++            if self.focus_zctrl(zctrl):
++                return
++
++    def find_zctrl_page(self, zctrl):
++        """Locate (processor, screen_index, chain_page_index) for a zctrl"""
++
++        proc = getattr(zctrl, "processor", None)
++        if not proc:
++            return None, None, None
++
++        screen_list = proc.get_ctrl_screens()
++        if screen_list:
++            for idx, page_zctrls in enumerate(screen_list.values()):
++                if zctrl in page_zctrls:
++                    return proc, idx, None
++
++        chain = getattr(proc, "chain", None)
++        if chain and zctrl in chain.zctrls:
++            return proc, None, chain.zctrls.index(zctrl) // 4
++
++        return None, None, None
++
++    def find_list_index_for_page(self, proc, screen_index, chain_page_index=None):
++        """Find listbox row index in self.list_data for a processor page or chain controller page"""
++
++        if chain_page_index is not None:
++            for idx, row in enumerate(self.list_data):
++                if len(row) >= 5 and row[1] == -1 and row[4] == chain_page_index:
++                    return idx
++        elif screen_index is not None:
++            for idx, row in enumerate(self.list_data):
++                if len(row) >= 5 and row[1] and row[1] > 0 and row[3] == proc and row[4] == screen_index:
++                    return idx
++        return None
++
++    def focus_zctrl(self, zctrl):
++        """Switch chain/processor and encoder page to display the given zctrl"""
++
++        proc, screen_index, chain_page_index = self.find_zctrl_page(zctrl)
++        if proc is None:
++            return False
++
++        # Special processors (not in a chain): ALSA Mixer, Global Audio Player, Tempo
++        if proc.id < -1:
++            if proc == self.zyngui.state_manager.alsa_mixer_processor:
++                target_screen = "alsa_mixer"
++            elif proc == self.zyngui.state_manager.audio_player:
++                target_screen = "audio_player"
++            elif proc == self.zyngui.state_manager.tempo_processor:
++                target_screen = "tempo"
++            else:
++                return False
++
++            if screen_index is not None:
++                proc.set_current_screen_index(screen_index)
++
++            if self.parent is None and self.zyngui.current_screen == target_screen:
++                target_index = self.find_list_index_for_page(proc, screen_index)
++                if target_index is None:
++                    self.fill_list()
++                    target_index = self.find_list_index_for_page(proc, screen_index)
++                if target_index is not None:
++                    self.select(target_index)
++                    return True
++                return False
++            else:
++                self.zyngui.show_screen(target_screen, hmode=self.zyngui.SCREEN_HMODE_REPLACE)
++                return True
++
++        # Regular chain processor
++        chain_id = proc.chain_id
++        if chain_id is None or chain_id not in self.chain_manager.chains:
++            return False
++
++        target_chain = self.chain_manager.chains[chain_id]
++        target_proc = proc
++        if screen_index is not None:
++            target_proc.set_current_screen_index(screen_index)
++        elif chain_page_index is not None:
++            chain_procs = self.chain_manager.get_processors(chain_id)
++            if not chain_procs:
++                return False
++            target_proc = chain_procs[0]
++            n_chain_pages = (len(target_chain.zctrls) + 3) // 4
++            target_proc.set_current_screen_index(chain_page_index - n_chain_pages - 1)
++        target_chain.set_current_processor(target_proc)
++
++        # Currently inside chain_control
++        if self.parent:
++            active_chain_id = self.chain_manager.active_chain.chain_id if self.chain_manager.active_chain else None
++            if active_chain_id != chain_id:
++                # Clear saved side-chain selection so chain_canvas focuses target_chain.current_processor
++                self.parent.chain_canvas.selected_index = None
++                self.chain_manager.set_active_chain_by_id(chain_id)
++                return True
++            if self.parent.chain_id != chain_id:
++                # Chain switch signal is already queued/in-flight; updated proc & screen_index will be used
++                return True
++
++            # Same chain is already displayed => switch processor & encoder page directly
++            target_index = self.find_list_index_for_page(target_proc, screen_index, chain_page_index)
++            if target_index is None:
++                self.fill_list()
++                target_index = self.find_list_index_for_page(target_proc, screen_index, chain_page_index)
++            if target_index is not None:
++                self.select(target_index)
++                return True
++            return False
++
++        # Currently on standalone control screen (e.g. alsa_mixer / audio_player / tempo) => switch to chain_control
++        self.zyngui.chain_control(chain_id=chain_id, processor=target_proc,
++                                  hmode=self.zyngui.SCREEN_HMODE_REPLACE, reset=True)
++        return True
+ 
+     def midi_unlearn(self, param=None):
+         if param:
+@@ -850,6 +1002,10 @@ class zynthian_gui_control(zynthian_gui_selector):
+                 else:
+                     ccnum = "NONE"
+                 options[f"ZynStep CC [{ccnum}]"] = i
++                if zynthian_gui_config.midi_cc_autofocus:
++                    options["\u2612 MIDI Auto-Focus"] = i
++                else:
++                    options["\u2610 MIDI Auto-Focus"] = i
+             else:
+                 title = "Control unlearn"
+ 
+@@ -883,6 +1039,9 @@ class zynthian_gui_control(zynthian_gui_selector):
+             if self.processors[0].chain:
+                 self.processors[0].chain.toggle_zctrl(param)
+                 self.update_list()
++        elif option[2:] == "MIDI Auto-Focus":
++            self.toggle_midi_cc_autofocus()
++            self.controller_options(param, keep_selection=True)
+         elif option == "Show touchpad":
+             self.show_xy()
+         elif option == "Clear":
