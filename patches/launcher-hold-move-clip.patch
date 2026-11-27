@@ -1,8 +1,8 @@
 diff --git a/zyngine/zynthian_engine_clippy.py b/zyngine/zynthian_engine_clippy.py
-index fa862fb..698ba0e 100644
+index fa862fb..4ddbc7f 100644
 --- a/zyngine/zynthian_engine_clippy.py
 +++ b/zyngine/zynthian_engine_clippy.py
-@@ -250,6 +250,60 @@ class zynthian_engine_clippy(zynthian_engine):
+@@ -250,6 +250,95 @@ class zynthian_engine_clippy(zynthian_engine):
              self.set_state_post_note(proc_to, phrase_to + 1)
              proc_to.set_state_flag = False
  
@@ -60,11 +60,46 @@ index fa862fb..698ba0e 100644
 +        apply_clip_state(proc_a, phrase_a, state_b)
 +        apply_clip_state(proc_b, phrase_b, state_a)
 +
++    def clear_clip(self, proc, phrase):
++        """ Clear / unload an audio clip and reset its controllers to defaults
++        Args:
++            proc: Clippy processor
++            phrase: Phrase index to clear
++        """
++
++        note = phrase + 1
++        if not self.set_state_pre_note(proc, note):
++            return
++
++        self.libseq.setPlayState(self.zynseq.scene, phrase, proc.midi_chan, zynseq.SEQ_STOPPED)
++        defaults = {
++            "file": "",
++            "crop_start": 0,
++            "crop_end": MAX_FRAMES,
++            "zoom": 1,
++            "gain": 0.0,
++            "warp": 1,
++            "beats": 1,
++            "mode": 1,
++            "beat_slice": 1,
++        }
++        proc.set_state_flag = True
++        try:
++            for symbol in zctrl_symbols:
++                if symbol in defaults:
++                    try:
++                        proc.controllers_dict[f"{symbol} {note}"].set_value(defaults[symbol])
++                    except Exception as e:
++                        logging.warning(f"Can't reset clip {symbol} {note}: {e}")
++            self.set_state_post_note(proc, note)
++        finally:
++            proc.set_state_flag = False
++
      # ---------------------------------------------------------------
      # Sample loading, cropping & warping
      # ---------------------------------------------------------------
 diff --git a/zyngui/zynthian_gui_mixer.py b/zyngui/zynthian_gui_mixer.py
-index a947a9d..ebd133d 100644
+index a947a9d..5666dd6 100644
 --- a/zyngui/zynthian_gui_mixer.py
 +++ b/zyngui/zynthian_gui_mixer.py
 @@ -214,10 +214,10 @@ class zynthian_gui_launcher_pad():
@@ -149,7 +184,7 @@ index a947a9d..ebd133d 100644
              if not self.zyngui.osc_clients:
                  self.zyngui.state_manager.zynmixer_chan.enable_dpm(False)
                  self.zyngui.state_manager.zynmixer_bus.enable_dpm(False)
-@@ -1744,10 +1761,27 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -1744,10 +1761,29 @@ class zynthian_gui_mixer(zynthian_gui_base):
              phrase = self.zynseq.phrase
          self.left_canvas.itemconfig("launcher_pad", outline="")
          self.right_canvas.itemconfig("launcher_pad", outline="")
@@ -163,10 +198,12 @@ index a947a9d..ebd133d 100644
 +                src_pad.highlight("#FF8800")
 +            try:
 +                status = self.get_move_clip_target_status(phrase)
-+                if status == "same":
++                if status in ("same", "noop"):
 +                    color = "#FF8800"
 +                elif status in ("move", "swap"):
 +                    color = "#00FF00"
++                elif status == "clear":
++                    color = "#FF4400"
 +                else:
 +                    color = "#FF0000"
 +                self.highlighted_strip.launchers[phrase].highlight(color)
@@ -181,7 +218,7 @@ index a947a9d..ebd133d 100644
  
          # Scroll to ensure launcher is visible - use coords relative to launcher view
          launcher_top = phrase * self.launcher_height
-@@ -2030,6 +2064,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2030,6 +2066,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
                  self.zyngui.current_screen = "launcher"
              self.tts_title = "Launcher"
          else:
@@ -189,7 +226,7 @@ index a947a9d..ebd133d 100644
              self.left_canvas.itemconfig("fader", state=tkinter.NORMAL)
              self.right_canvas.itemconfig("fader", state=tkinter.NORMAL)
              self.left_canvas.itemconfig("fader_horizontal", state=tkinter.HIDDEN)
-@@ -2471,6 +2506,285 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2471,6 +2508,347 @@ class zynthian_gui_mixer(zynthian_gui_base):
          except Exception as e:
              logging.error(e)
  
@@ -260,7 +297,11 @@ index a947a9d..ebd133d 100644
 +
 +    def can_start_moving_clip(self):
 +        cell = self.get_active_cell_info()
-+        return cell is not None and self.is_cell_occupied(cell)
++        if cell is None:
++            return False
++        if cell[0] == "PHR":
++            return self.zynseq.phrases > 1
++        return cell[0] in ("PAT", "CLP")
 +
 +    def get_move_clip_target_status(self, phrase=None):
 +        if self.moving_clip is None:
@@ -268,44 +309,60 @@ index a947a9d..ebd133d 100644
 +        dst = self.get_active_cell_info(phrase)
 +        if dst is None or dst[0] != self.moving_clip[0]:
 +            return "invalid"
++        src_occupied = self.moving_clip[6]
 +        if dst[0] == "PAT":
 +            if dst[1] == self.moving_clip[1] and dst[2] == self.moving_clip[2]:
 +                return "same"
 +            if dst[3] == self.moving_clip[3]:
 +                return "invalid"
-+            return "swap" if self.is_cell_occupied(dst) else "move"
++            dst_occupied = self.is_cell_occupied(dst)
++            if src_occupied:
++                return "swap" if dst_occupied else "move"
++            return "clear" if dst_occupied else "noop"
 +        if dst[0] == "CLP":
 +            if dst[3] == self.moving_clip[3] and dst[1] == self.moving_clip[1]:
 +                return "same"
-+            return "swap" if self.is_cell_occupied(dst) else "move"
++            dst_occupied = self.is_cell_occupied(dst)
++            if src_occupied:
++                return "swap" if dst_occupied else "move"
++            return "clear" if dst_occupied else "noop"
 +        return "invalid"
 +
 +    def update_moving_clip_title(self, phrase=None):
 +        if self.moving_clip is None:
 +            return
 +        src_label = self.moving_clip[5]
++        src_occupied = self.moving_clip[6]
 +        status = self.get_move_clip_target_status(phrase)
-+        if status == "same":
-+            msg = f"Move {src_label} → select target"
-+        elif status == "move":
-+            dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
-+            msg = f"Move {src_label} → {dst_label}"
-+        elif status == "swap":
-+            dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
-+            msg = f"Swap {src_label} ↔ {dst_label}"
++        if src_occupied:
++            if status == "same":
++                msg = f"Move {src_label} → select target"
++            elif status == "move":
++                dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
++                msg = f"Move {src_label} → {dst_label}"
++            elif status == "swap":
++                dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
++                msg = f"Swap {src_label} ↔ {dst_label}"
++            else:
++                msg = f"Can't move {src_label} here"
 +        else:
-+            msg = f"Can't move {src_label} here"
++            if status in ("same", "noop"):
++                msg = f"Clear ({src_label}) → select clip"
++            elif status == "clear":
++                dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
++                msg = f"Clear {dst_label}"
++            else:
++                msg = "Can't clear here"
 +        self.set_title_ts = 0
 +        self.set_title(msg)
 +
 +    def start_moving_clip(self):
 +        cell = self.get_active_cell_info()
-+        if cell is None or not self.is_cell_occupied(cell):
-+            if cell is not None and cell[0] in ("PAT", "CLP"):
-+                self.set_title_ts = 0
-+                self.set_title("Empty cell", timeout=1.0)
++        if cell is None:
 +            return False
 +        if cell[0] == "PHR":
++            if self.zynseq.phrases <= 1:
++                return False
 +            self.moving_phrase = True
 +            self._moving_phrase_hold = True
 +            self.zyngui.zynswitch_disable_autolong()
@@ -314,8 +371,11 @@ index a947a9d..ebd133d 100644
 +                    strip.launchers[self.zynseq.phrase].last_state = None
 +            self.refresh_launchers(force=False)
 +            return True
++        if cell[0] not in ("PAT", "CLP"):
++            return False
 +        src_label = self.get_cell_label(cell)
-+        self.moving_clip = (*cell, src_label)
++        src_occupied = self.is_cell_occupied(cell)
++        self.moving_clip = (*cell, src_label, src_occupied)
 +        self.zyngui.zynswitch_disable_autolong()
 +        src_pad = self.get_launcher_pad(cell[4], cell[1])
 +        if src_pad is not None:
@@ -369,7 +429,7 @@ index a947a9d..ebd133d 100644
 +        self.set_title_ts = 0
 +        self.set_title()
 +
-+        if status == "same":
++        if status in ("same", "noop"):
 +            if src_pad is not None:
 +                src_pad.draw(force=True)
 +            self.highlight_launcher()
@@ -380,11 +440,19 @@ index a947a9d..ebd133d 100644
 +                src_pad.draw(force=True)
 +            self.highlight_launcher()
 +            self.set_title_ts = 0
-+            self.set_title(f"Can't move {src[5]} here", timeout=1.5)
++            err_msg = f"Can't move {src[5]} here" if src[6] else "Can't clear here"
++            self.set_title(err_msg, timeout=1.5)
 +            return False
 +
 +        dst_label = self.get_cell_label(dst)
-+        if src[0] == "PAT":
++        if status == "clear":
++            if dst[0] == "PAT":
++                ok = self.clear_pattern_cell(dst)
++            elif dst[0] == "CLP":
++                ok = self.clear_clippy_cell(dst)
++            else:
++                ok = False
++        elif src[0] == "PAT":
 +            ok = self.swap_patterns(src, dst)
 +        elif src[0] == "CLP":
 +            ok = self.swap_clippy_clips(src, dst)
@@ -395,7 +463,9 @@ index a947a9d..ebd133d 100644
 +            self.zynseq.refresh_state()
 +            self.refresh_launchers(force=True)
 +            self.set_title_ts = 0
-+            if status == "swap":
++            if status == "clear":
++                self.set_title(f"Cleared {dst_label}", timeout=1.5)
++            elif status == "swap":
 +                self.set_title(f"Swapped {src[5]} ↔ {dst_label}", timeout=1.5)
 +            else:
 +                self.set_title(f"Moved {src[5]} → {dst_label}", timeout=1.5)
@@ -404,6 +474,35 @@ index a947a9d..ebd133d 100644
 +                src_pad.draw(force=True)
 +            self.highlight_launcher()
 +        return ok
++
++    def clear_pattern_cell(self, dst):
++        try:
++            scene = self.zynseq.scene
++            dst_phrase, dst_chan, dst_pat = dst[1], dst[2], dst[3]
++            if self.zynseq.libseq.getPlayState(scene, dst_phrase, dst_chan) != zynseq.SEQ_STOPPED:
++                self.zynseq.libseq.setPlayState(scene, dst_phrase, dst_chan, zynseq.SEQ_STOPPED)
++                self.zynseq.libseq.sendMidiCommand(0xB0 | dst_chan, 123, 0)
++            self.zynseq.libseq.clearPattern(dst_pat)
++            self.zynseq.set_sequence_param(scene, dst_phrase, dst_chan, "name", "")
++            self.zynseq.set_sequence_param(scene, dst_phrase, dst_chan, "repeat", 255)
++            self.zynseq.libseq.updateSequenceInfo()
++            return True
++        except Exception as e:
++            logging.error(f"Can't clear pattern: {e}")
++            return False
++
++    def clear_clippy_cell(self, dst):
++        try:
++            dst_phrase, dst_proc = dst[1], dst[3]
++            self.state_manager.start_busy("clear_clip", "Clearing audio clip...")
++            try:
++                dst_proc.engine.clear_clip(dst_proc, dst_phrase)
++            finally:
++                self.state_manager.end_busy("clear_clip")
++            return True
++        except Exception as e:
++            logging.error(f"Can't clear audio clip: {e}")
++            return False
 +
 +    def swap_patterns(self, src, dst):
 +        try:
@@ -475,7 +574,7 @@ index a947a9d..ebd133d 100644
      # --------------------------------------------------------------------------
      # Physical UI Control Management: Pots & switches
      # --------------------------------------------------------------------------
-@@ -2485,6 +2799,10 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2485,6 +2863,10 @@ class zynthian_gui_mixer(zynthian_gui_base):
          if super().switch_select(type):
              return True
          elif type == "S":
@@ -486,7 +585,7 @@ index a947a9d..ebd133d 100644
              if self.moving_chain:
                  self.end_moving_chain()
                  return True
-@@ -2513,6 +2831,9 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2513,6 +2895,9 @@ class zynthian_gui_mixer(zynthian_gui_base):
          returns True if event is managed, False if it's not
          """
  
@@ -496,7 +595,7 @@ index a947a9d..ebd133d 100644
          if self.moving_chain:
              self.end_moving_chain()
              return True
-@@ -2559,8 +2880,36 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2559,8 +2944,36 @@ class zynthian_gui_mixer(zynthian_gui_base):
              case 3:
                  return self.switch_select(t)
  
@@ -533,7 +632,7 @@ index a947a9d..ebd133d 100644
              # Use F1-F2 as copy/paste buttons
              if self.switch_i_clipboard and swi in self.switch_i_clipboard:
                  index = self.switch_i_clipboard.index(swi)
-@@ -2843,6 +3192,24 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2843,6 +3256,24 @@ class zynthian_gui_mixer(zynthian_gui_base):
              if self.wsled_i_add_chain is not None:
                  wsl.set_led(leds[self.wsled_i_add_chain], wsl.wscolor_active2)
  
@@ -542,9 +641,9 @@ index a947a9d..ebd133d 100644
 +                wsli = self.wsled_i_move_clip
 +                if self.moving_clip is not None:
 +                    status = self.get_move_clip_target_status()
-+                    if status in ("move", "swap"):
++                    if status in ("move", "swap", "clear"):
 +                        wsl.blink(leds[wsli], wsl.wscolor_active)
-+                    elif status == "same":
++                    elif status in ("same", "noop"):
 +                        wsl.blink(leds[wsli], wsl.wscolor_active2)
 +                    else:
 +                        wsl.blink(leds[wsli], wsl.wscolor_red)

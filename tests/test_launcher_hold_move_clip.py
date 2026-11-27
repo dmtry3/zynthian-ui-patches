@@ -170,6 +170,7 @@ class FakeLibSeq:
         # (scene, phrase, chan) -> play_state
         self.play_states = {}
         self.midi_commands = []
+        self.cleared_patterns = []
         self.update_info_calls = 0
 
     def getPattern(self, scene, phrase, chan, track, pos):
@@ -184,6 +185,10 @@ class FakeLibSeq:
 
     def isPatternEmpty(self, pat):
         return self.empty_patterns.get(pat, True)
+
+    def clearPattern(self, pat):
+        self.empty_patterns[pat] = True
+        self.cleared_patterns.append(pat)
 
     def getSequenceName(self, scene, phrase, chan):
         return self.names.get((scene, phrase, chan), "").encode("utf-8")
@@ -517,12 +522,60 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
         self.assertEqual(self.zynseq.libseq.patterns[(0, 0, 0)], 101)
         self.assertEqual(self.zynseq.libseq.patterns[(0, 0, 1)], 201)
 
-    def test_hold_f4_on_empty_cell_does_not_start_move(self):
-        self.move_cursor(0, 1)  # empty MIDI cell
+    def test_hold_f4_empty_midi_cell_clears_occupied_target(self):
+        # Start on empty MIDI cell A2 (chain 0, phrase 1)
+        self.zynseq.libseq.play_states[(0, 2, 1)] = zynseq_const.SEQ_PLAYING
+        self.move_cursor(0, 1)
         self.assertFalse(self.mixer.switch(23, "P"))
-        self.assertIsNone(self.mixer.moving_clip)
-        self.zyngui.zynswitch_disable_autolong.assert_not_called()
-        self.assertTrue(self.mixer.switch(23, "S"))
+        self.assertIsNotNone(self.mixer.moving_clip)
+        self.assertFalse(self.mixer.moving_clip[6])  # source is empty
+        self.zyngui.zynswitch_disable_autolong.assert_called_once()
+
+        # Over another empty MIDI cell -> noop
+        self.move_cursor(1, 0)
+        self.assertEqual(self.mixer.get_move_clip_target_status(), "noop")
+
+        # Over occupied MIDI cell Lead (chain 1, phrase 2, pat 203) -> clear
+        self.move_cursor(1, 2)
+        self.assertEqual(self.mixer.get_move_clip_target_status(), "clear")
+        self.assertEqual(self.mixer.chain_strips[1].launchers[2].outline, "#FF4400")
+        self.assertIn("Clear Lead", [t[0] for t in self.mixer.titles])
+
+        # Release F4 -> target cleared, stopped with All Notes Off, source stays empty
+        self.assertTrue(self.mixer.switch(23, "B"))
+        self.assertIn(203, self.zynseq.libseq.cleared_patterns)
+        self.assertTrue(self.zynseq.libseq.empty_patterns[203])
+        self.assertEqual(self.zynseq.libseq.names[(0, 2, 1)], "")
+        self.assertEqual(self.zynseq.libseq.repeats[(0, 2, 1)], 255)
+        self.assertEqual(self.zynseq.libseq.play_states[(0, 2, 1)], zynseq_const.SEQ_STOPPED)
+        self.assertIn((0xB1, 123, 0), self.zynseq.libseq.midi_commands)
+        self.assertTrue(self.zynseq.libseq.empty_patterns[102])
+        self.assertEqual(self.mixer.titles[-1], ("Cleared Lead", 1.5))
+        self.zyngui.zynswitch_enable_autolong.assert_called_once()
+
+    def test_hold_f4_empty_midi_cell_on_empty_target_is_noop(self):
+        self.move_cursor(0, 1)  # empty A2
+        self.mixer.switch(23, "P")
+        self.move_cursor(1, 0)  # empty B1
+        self.assertEqual(self.mixer.get_move_clip_target_status(), "noop")
+        self.assertTrue(self.mixer.switch(23, "B"))
+        self.assertEqual(self.zynseq.libseq.cleared_patterns, [])
+        self.assertEqual(self.zynseq.refresh_calls, 0)
+        self.zyngui.zynswitch_enable_autolong.assert_called_once()
+
+    def test_hold_f4_empty_clippy_cell_clears_occupied_audio_clip(self):
+        # Start on empty Clippy cell (Chain 3, phrase 1)
+        self.move_cursor(2, 1)
+        self.mixer.switch(23, "P")
+        # Move to occupied Clippy cell (Chain 4, phrase 1, loop2.wav)
+        self.move_cursor(3, 1)
+        self.assertEqual(self.mixer.get_move_clip_target_status(), "clear")
+        self.assertTrue(self.mixer.switch(23, "B"))
+
+        self.assertEqual(self.proc_clp2.controllers_dict["file 2"].value, "")
+        self.assertEqual(self.proc_clp2.controllers_dict["gain 2"].value, 0.0)
+        self.assertFalse(self.proc_clp2.set_state_flag)
+        self.assertEqual(self.proc_clp1.controllers_dict["file 2"].value, "")
 
     def test_f4_ignored_outside_alt_or_launcher_mode(self):
         self.mixer.alt_mode = False
@@ -592,13 +645,18 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
     def test_wsleds_reflect_move_clip_state(self):
         leds = list(range(16))
 
-        # Idle on movable cell -> solid orange (active2)
+        # Idle on movable cell (occupied or empty) -> solid orange (active2)
         self.mixer.update_wsleds(leds)
         self.wsleds.set_led.assert_any_call(13, "ORANGE")
 
-        # Idle on empty cell -> alt purple
         self.wsleds.set_led.reset_mock()
         self.move_cursor(0, 1)
+        self.mixer.update_wsleds(leds)
+        self.wsleds.set_led.assert_any_call(13, "ORANGE")
+
+        # Idle on non-movable audio-only chain (midi_chan=None, chain_id!=0) -> alt purple
+        self.wsleds.set_led.reset_mock()
+        self.active_chain = FakeChain(9, None)
         self.mixer.update_wsleds(leds)
         self.wsleds.set_led.assert_any_call(13, "PURPLE")
 
