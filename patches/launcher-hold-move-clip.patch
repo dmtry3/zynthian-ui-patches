@@ -1,0 +1,560 @@
+diff --git a/zyngine/zynthian_engine_clippy.py b/zyngine/zynthian_engine_clippy.py
+index fa862fb..698ba0e 100644
+--- a/zyngine/zynthian_engine_clippy.py
++++ b/zyngine/zynthian_engine_clippy.py
+@@ -250,6 +250,60 @@ class zynthian_engine_clippy(zynthian_engine):
+             self.set_state_post_note(proc_to, phrase_to + 1)
+             proc_to.set_state_flag = False
+ 
++    def swap_clips(self, proc_a, phrase_a, proc_b, phrase_b):
++        """ Swap two audio clips (or move a clip into an empty cell)
++        Args:
++            proc_a: First clippy processor
++            phrase_a: Phrase index of first clip
++            proc_b: Second clippy processor
++            phrase_b: Phrase index of second clip
++        """
++
++        if proc_a == proc_b and phrase_a == phrase_b:
++            return
++
++        note_a = phrase_a + 1
++        note_b = phrase_b + 1
++
++        state_a = {}
++        state_b = {}
++        for symbol in zctrl_symbols:
++            try:
++                state_a[symbol] = proc_a.controllers_dict[f"{symbol} {note_a}"].value
++            except KeyError:
++                pass
++            try:
++                state_b[symbol] = proc_b.controllers_dict[f"{symbol} {note_b}"].value
++            except KeyError:
++                pass
++
++        def apply_clip_state(proc, phrase, state):
++            note = phrase + 1
++            if not self.set_state_pre_note(proc, note):
++                return
++            proc.set_state_flag = True
++            try:
++                for symbol in zctrl_symbols:
++                    if symbol in state:
++                        try:
++                            proc.controllers_dict[f"{symbol} {note}"].set_value(state[symbol])
++                        except Exception as e:
++                            logging.warning(f"Can't apply clip {symbol} {note}: {e}")
++                self.set_state_post_note(proc, note)
++                if state.get("file") and "gain" in state:
++                    try:
++                        self.libclippy.setGain(proc.midi_chan - 16, phrase, ctypes.c_float(state["gain"]))
++                    except Exception as e:
++                        logging.warning(e)
++            finally:
++                proc.set_state_flag = False
++
++        self.libseq.setPlayState(self.zynseq.scene, phrase_a, proc_a.midi_chan, zynseq.SEQ_STOPPED)
++        self.libseq.setPlayState(self.zynseq.scene, phrase_b, proc_b.midi_chan, zynseq.SEQ_STOPPED)
++
++        apply_clip_state(proc_a, phrase_a, state_b)
++        apply_clip_state(proc_b, phrase_b, state_a)
++
+     # ---------------------------------------------------------------
+     # Sample loading, cropping & warping
+     # ---------------------------------------------------------------
+diff --git a/zyngui/zynthian_gui_mixer.py b/zyngui/zynthian_gui_mixer.py
+index a947a9d..ebd133d 100644
+--- a/zyngui/zynthian_gui_mixer.py
++++ b/zyngui/zynthian_gui_mixer.py
+@@ -214,10 +214,10 @@ class zynthian_gui_launcher_pad():
+         self.canvas.move(self.timesig, dx, dy)
+         self.canvas.move(self.tempo, dx, dy)
+ 
+-    def highlight(self):
++    def highlight(self, color="yellow"):
+         """ Show selection cursor highlight"""
+ 
+-        self.canvas.itemconfig(self.pad, outline="yellow")
++        self.canvas.itemconfig(self.pad, outline=color)
+ 
+     def get_pattern_length(self, beats, bpb):
+         if not bpb:
+@@ -297,6 +297,9 @@ class zynthian_gui_launcher_pad():
+                     title = f"⇑ {name[:6]}"
+                 else:
+                     title = f"⇕ {name[:6]}"
++            # Moving clip source cell
++            elif self.gui_mixer.is_moving_clip_source(self.chain.chain_id, self.phrase):
++                title = f"⇄ {name[:6]}"
+             # Normal draw
+             else:
+                 title = name[:7]
+@@ -495,6 +498,8 @@ class zynthian_gui_launcher_pad():
+         ts /= 1000.0
+         self.gui_mixer.select_launcher(self.phrase)
+         self.gui_mixer.update_active_chain(self.chain.chain_id, True)
++        if self.gui_mixer.moving_clip is not None:
++            return
+         if ts < zynthian_gui_config.zynswitch_bold_seconds:
+             self.on_clip_short_press()
+         elif ts < zynthian_gui_config.zynswitch_long_seconds:
+@@ -1250,6 +1255,9 @@ class zynthian_gui_mixer(zynthian_gui_base):
+         self.highlighted_strip = None  # Highligted mixer strip object
+         self.moving_chain = False  # True if moving a chain left/right
+         self.moving_phrase = False # True if moving a launcher phrase up/down
++        self.moving_clip = None    # Source clip info while holding F4/S4 to move/swap
++        self._moving_phrase_hold = False  # True if moving_phrase was started by holding F4/S4
++        self._move_clip_cancelled = False # True if active hold-move was cancelled before button release
+ 
+         # List of (strip,control) requiring gui refresh (control=None for whole strip refresh)
+         self.pending_refresh_queue = set()
+@@ -1289,16 +1297,22 @@ class zynthian_gui_mixer(zynthian_gui_base):
+             self.wsleds_i_clipboard = [10, 11]
+             self.switch_i_add_chain = 19
+             self.wsled_i_add_chain = 12
++            self.switch_i_move_clip = 23
++            self.wsled_i_move_clip = 13
+         elif zynthian_gui_config.check_wiring_layout(["Z2"]):
+             self.switch_i_clipboard = [10, 11]
+             self.wsleds_i_clipboard = [10, 11]
+             self.switch_i_add_chain = 12
+             self.wsled_i_add_chain = 12
++            self.switch_i_move_clip = 13
++            self.wsled_i_move_clip = 13
+         elif zynthian_gui_config.check_wiring_layout(["MCP23017"]):
+             self.switch_i_clipboard = [4, 5]
+             self.wsleds_i_clipboard = None
+             self.switch_i_add_chain = 6
+             self.wsled_i_add_chain = None
++            self.switch_i_move_clip = 7
++            self.wsled_i_move_clip = None
+             # Auto-enable ALT-mode to get alt. functions for S1-S4 buttons
+             self.alt_mode = True
+         else:
+@@ -1306,6 +1320,8 @@ class zynthian_gui_mixer(zynthian_gui_base):
+             self.wsleds_i_clipboard = None
+             self.switch_i_add_chain = None
+             self.wsled_i_add_chain = None
++            self.switch_i_move_clip = None
++            self.wsled_i_move_clip = None
+ 
+         self.update_layout()
+         self.tts_title = "Mixer"
+@@ -1562,6 +1578,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
+         """ Function to handle hiding display
+         """
+         if self.shown:
++            self.cancel_moving_clip(keep_swallow=False)
+             if not self.zyngui.osc_clients:
+                 self.zyngui.state_manager.zynmixer_chan.enable_dpm(False)
+                 self.zyngui.state_manager.zynmixer_bus.enable_dpm(False)
+@@ -1744,10 +1761,27 @@ class zynthian_gui_mixer(zynthian_gui_base):
+             phrase = self.zynseq.phrase
+         self.left_canvas.itemconfig("launcher_pad", outline="")
+         self.right_canvas.itemconfig("launcher_pad", outline="")
+-        try:
+-            self.highlighted_strip.launchers[phrase].highlight()
+-        except:
+-            pass
++        if self.moving_clip is not None:
++            src_pad = self.get_launcher_pad(self.moving_clip[4], self.moving_clip[1])
++            if src_pad is not None:
++                src_pad.highlight("#FF8800")
++            try:
++                status = self.get_move_clip_target_status(phrase)
++                if status == "same":
++                    color = "#FF8800"
++                elif status in ("move", "swap"):
++                    color = "#00FF00"
++                else:
++                    color = "#FF0000"
++                self.highlighted_strip.launchers[phrase].highlight(color)
++            except:
++                pass
++            self.update_moving_clip_title(phrase)
++        else:
++            try:
++                self.highlighted_strip.launchers[phrase].highlight()
++            except:
++                pass
+ 
+         # Scroll to ensure launcher is visible - use coords relative to launcher view
+         launcher_top = phrase * self.launcher_height
+@@ -2030,6 +2064,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
+                 self.zyngui.current_screen = "launcher"
+             self.tts_title = "Launcher"
+         else:
++            self.cancel_moving_clip(keep_swallow=False)
+             self.left_canvas.itemconfig("fader", state=tkinter.NORMAL)
+             self.right_canvas.itemconfig("fader", state=tkinter.NORMAL)
+             self.left_canvas.itemconfig("fader_horizontal", state=tkinter.HIDDEN)
+@@ -2471,6 +2506,285 @@ class zynthian_gui_mixer(zynthian_gui_base):
+         except Exception as e:
+             logging.error(e)
+ 
++    # --------------------------------------------------------------------------
++    # Hold-button Move / Swap clip functionality (ALT + F4 / S4)
++    # --------------------------------------------------------------------------
++
++    def get_launcher_pad(self, chain_id, phrase):
++        if phrase is None or phrase < 0:
++            return None
++        for strip in self.chain_strips:
++            if strip.chain.chain_id == chain_id:
++                if phrase < len(strip.launchers):
++                    return strip.launchers[phrase]
++                return None
++        return None
++
++    def is_moving_clip_source(self, chain_id, phrase):
++        return self.moving_clip is not None and self.moving_clip[4] == chain_id and self.moving_clip[1] == phrase
++
++    def get_active_cell_info(self, phrase=None):
++        if phrase is None:
++            phrase = self.zynseq.phrase
++        if phrase is None or phrase < 0 or phrase >= self.zynseq.phrases:
++            return None
++        chain = self.chain_manager.get_active_chain()
++        if chain is None:
++            return None
++        if chain.chain_id == 0:
++            return ("PHR", phrase, zynseq.PHRASE_CHANNEL, None, 0)
++        if type(chain.midi_chan) is int and 0 <= chain.midi_chan < 16:
++            pattern = self.zynseq.libseq.getPattern(self.zynseq.scene, phrase, chain.midi_chan, 0, 0)
++            if pattern is None or pattern == 0xFFFFFFFF:
++                return None
++            return ("PAT", phrase, chain.midi_chan, pattern, chain.chain_id)
++        if type(chain.midi_chan) is int and 15 < chain.midi_chan < zynseq.PHRASE_CHANNEL:
++            procs = chain.get_processors()
++            if not procs:
++                return None
++            return ("CLP", phrase, chain.midi_chan, procs[0], chain.chain_id)
++        return None
++
++    def is_cell_occupied(self, cell_info):
++        if cell_info is None:
++            return False
++        kind = cell_info[0]
++        if kind == "PAT":
++            return not self.zynseq.is_pattern_empty(cell_info[3])
++        if kind == "CLP":
++            return bool(cell_info[3].engine.is_clip_busy(cell_info[3], cell_info[1]))
++        if kind == "PHR":
++            return self.zynseq.phrases > 1
++        return False
++
++    def get_cell_label(self, cell_info):
++        if cell_info is None:
++            return ""
++        kind, phrase, chan = cell_info[0], cell_info[1], cell_info[2]
++        if kind == "PHR":
++            return self.get_phrase_title(phrase)
++        try:
++            name = self.zynseq.get_sequence_name(self.zynseq.scene, phrase, chan)
++            if name:
++                return name
++        except:
++            pass
++        return f"{zynseq.CHANNEL_CHARS[chan]}{phrase + 1}"
++
++    def can_start_moving_clip(self):
++        cell = self.get_active_cell_info()
++        return cell is not None and self.is_cell_occupied(cell)
++
++    def get_move_clip_target_status(self, phrase=None):
++        if self.moving_clip is None:
++            return "invalid"
++        dst = self.get_active_cell_info(phrase)
++        if dst is None or dst[0] != self.moving_clip[0]:
++            return "invalid"
++        if dst[0] == "PAT":
++            if dst[1] == self.moving_clip[1] and dst[2] == self.moving_clip[2]:
++                return "same"
++            if dst[3] == self.moving_clip[3]:
++                return "invalid"
++            return "swap" if self.is_cell_occupied(dst) else "move"
++        if dst[0] == "CLP":
++            if dst[3] == self.moving_clip[3] and dst[1] == self.moving_clip[1]:
++                return "same"
++            return "swap" if self.is_cell_occupied(dst) else "move"
++        return "invalid"
++
++    def update_moving_clip_title(self, phrase=None):
++        if self.moving_clip is None:
++            return
++        src_label = self.moving_clip[5]
++        status = self.get_move_clip_target_status(phrase)
++        if status == "same":
++            msg = f"Move {src_label} → select target"
++        elif status == "move":
++            dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
++            msg = f"Move {src_label} → {dst_label}"
++        elif status == "swap":
++            dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
++            msg = f"Swap {src_label} ↔ {dst_label}"
++        else:
++            msg = f"Can't move {src_label} here"
++        self.set_title_ts = 0
++        self.set_title(msg)
++
++    def start_moving_clip(self):
++        cell = self.get_active_cell_info()
++        if cell is None or not self.is_cell_occupied(cell):
++            if cell is not None and cell[0] in ("PAT", "CLP"):
++                self.set_title_ts = 0
++                self.set_title("Empty cell", timeout=1.0)
++            return False
++        if cell[0] == "PHR":
++            self.moving_phrase = True
++            self._moving_phrase_hold = True
++            self.zyngui.zynswitch_disable_autolong()
++            for strip in self.chain_strips:
++                if self.zynseq.phrase < len(strip.launchers):
++                    strip.launchers[self.zynseq.phrase].last_state = None
++            self.refresh_launchers(force=False)
++            return True
++        src_label = self.get_cell_label(cell)
++        self.moving_clip = (*cell, src_label)
++        self.zyngui.zynswitch_disable_autolong()
++        src_pad = self.get_launcher_pad(cell[4], cell[1])
++        if src_pad is not None:
++            src_pad.last_state = None
++            src_pad.draw(force=True)
++        self.highlight_launcher()
++        return True
++
++    def cancel_moving_clip(self, keep_swallow=False):
++        if self._moving_phrase_hold:
++            self._moving_phrase_hold = False
++            if keep_swallow:
++                self._move_clip_cancelled = True
++            else:
++                self._move_clip_cancelled = False
++                self.zyngui.zynswitch_enable_autolong()
++            self.end_moving_phrase()
++            return True
++        if self.moving_clip is not None:
++            src_pad = self.get_launcher_pad(self.moving_clip[4], self.moving_clip[1])
++            self.moving_clip = None
++            if keep_swallow:
++                self._move_clip_cancelled = True
++            else:
++                self._move_clip_cancelled = False
++                self.zyngui.zynswitch_enable_autolong()
++            if src_pad is not None:
++                src_pad.last_state = None
++                src_pad.draw(force=True)
++            self.set_title_ts = 0
++            self.set_title()
++            self.highlight_launcher()
++            return True
++        if not keep_swallow and self._move_clip_cancelled:
++            self._move_clip_cancelled = False
++            self.zyngui.zynswitch_enable_autolong()
++        return False
++
++    def finish_moving_clip(self):
++        if self.moving_clip is None:
++            return False
++        src = self.moving_clip
++        dst = self.get_active_cell_info()
++        status = self.get_move_clip_target_status()
++        src_pad = self.get_launcher_pad(src[4], src[1])
++        self.moving_clip = None
++        if src_pad is not None:
++            src_pad.last_state = None
++
++        # Restore base title before showing any toast so timeout reverts cleanly
++        self.set_title_ts = 0
++        self.set_title()
++
++        if status == "same":
++            if src_pad is not None:
++                src_pad.draw(force=True)
++            self.highlight_launcher()
++            return False
++
++        if status == "invalid" or dst is None:
++            if src_pad is not None:
++                src_pad.draw(force=True)
++            self.highlight_launcher()
++            self.set_title_ts = 0
++            self.set_title(f"Can't move {src[5]} here", timeout=1.5)
++            return False
++
++        dst_label = self.get_cell_label(dst)
++        if src[0] == "PAT":
++            ok = self.swap_patterns(src, dst)
++        elif src[0] == "CLP":
++            ok = self.swap_clippy_clips(src, dst)
++        else:
++            ok = False
++
++        if ok:
++            self.zynseq.refresh_state()
++            self.refresh_launchers(force=True)
++            self.set_title_ts = 0
++            if status == "swap":
++                self.set_title(f"Swapped {src[5]} ↔ {dst_label}", timeout=1.5)
++            else:
++                self.set_title(f"Moved {src[5]} → {dst_label}", timeout=1.5)
++        else:
++            if src_pad is not None:
++                src_pad.draw(force=True)
++            self.highlight_launcher()
++        return ok
++
++    def swap_patterns(self, src, dst):
++        try:
++            scene = self.zynseq.scene
++            src_phrase, src_chan, src_pat = src[1], src[2], src[3]
++            dst_phrase, dst_chan, dst_pat = dst[1], dst[2], dst[3]
++
++            # Stop both sequences cleanly before swapping their patterns
++            if self.zynseq.libseq.getPlayState(scene, src_phrase, src_chan) != zynseq.SEQ_STOPPED:
++                self.zynseq.libseq.setPlayState(scene, src_phrase, src_chan, zynseq.SEQ_STOPPED)
++                self.zynseq.libseq.sendMidiCommand(0xB0 | src_chan, 123, 0)
++            if self.zynseq.libseq.getPlayState(scene, dst_phrase, dst_chan) != zynseq.SEQ_STOPPED:
++                self.zynseq.libseq.setPlayState(scene, dst_phrase, dst_chan, zynseq.SEQ_STOPPED)
++                self.zynseq.libseq.sendMidiCommand(0xB0 | dst_chan, 123, 0)
++
++            src_name_raw = self.zynseq.libseq.getSequenceName(scene, src_phrase, src_chan)
++            dst_name_raw = self.zynseq.libseq.getSequenceName(scene, dst_phrase, dst_chan)
++            src_name = src_name_raw.decode("utf-8") if isinstance(src_name_raw, bytes) else (src_name_raw or "")
++            dst_name = dst_name_raw.decode("utf-8") if isinstance(dst_name_raw, bytes) else (dst_name_raw or "")
++            src_repeat = self.zynseq.libseq.getSequenceRepeat(scene, src_phrase, src_chan)
++            dst_repeat = self.zynseq.libseq.getSequenceRepeat(scene, dst_phrase, dst_chan)
++
++            self.zynseq.libseq.removePattern(scene, src_phrase, src_chan, 0, 0)
++            self.zynseq.libseq.removePattern(scene, dst_phrase, dst_chan, 0, 0)
++            self.zynseq.libseq.addPattern(scene, src_phrase, src_chan, 0, 0, dst_pat, True)
++            self.zynseq.libseq.addPattern(scene, dst_phrase, dst_chan, 0, 0, src_pat, True)
++
++            self.zynseq.set_sequence_param(scene, src_phrase, src_chan, "name", dst_name)
++            self.zynseq.set_sequence_param(scene, dst_phrase, dst_chan, "name", src_name)
++            self.zynseq.set_sequence_param(scene, src_phrase, src_chan, "repeat", dst_repeat)
++            self.zynseq.set_sequence_param(scene, dst_phrase, dst_chan, "repeat", src_repeat)
++
++            # Keep clipboard entries aligned with swapped pattern coordinates
++            for idx, item in enumerate(self.clipboard):
++                if item is not None and item[0] == "PAT":
++                    if item[3] == src_pat:
++                        self.clipboard[idx] = ("PAT", dst_phrase, dst_chan, src_pat)
++                    elif item[3] == dst_pat:
++                        self.clipboard[idx] = ("PAT", src_phrase, src_chan, dst_pat)
++
++            self.zynseq.libseq.updateSequenceInfo()
++            return True
++        except Exception as e:
++            logging.error(f"Can't swap patterns: {e}")
++            return False
++
++    def swap_clippy_clips(self, src, dst):
++        try:
++            src_phrase, src_chan, src_proc = src[1], src[2], src[3]
++            dst_phrase, dst_chan, dst_proc = dst[1], dst[2], dst[3]
++            self.state_manager.start_busy("move_clip", "Moving audio clip...")
++            try:
++                src_proc.engine.swap_clips(src_proc, src_phrase, dst_proc, dst_phrase)
++            finally:
++                self.state_manager.end_busy("move_clip")
++
++            # Keep clipboard entries aligned with swapped clip coordinates
++            for idx, item in enumerate(self.clipboard):
++                if item is not None and item[0] == "CLP":
++                    if item[3] == src_proc and item[1] == src_phrase:
++                        self.clipboard[idx] = ("CLP", dst_phrase, dst_chan, dst_proc)
++                    elif item[3] == dst_proc and item[1] == dst_phrase:
++                        self.clipboard[idx] = ("CLP", src_phrase, src_chan, src_proc)
++            return True
++        except Exception as e:
++            logging.error(f"Can't swap audio clips: {e}")
++            return False
++
+     # --------------------------------------------------------------------------
+     # Physical UI Control Management: Pots & switches
+     # --------------------------------------------------------------------------
+@@ -2485,6 +2799,10 @@ class zynthian_gui_mixer(zynthian_gui_base):
+         if super().switch_select(type):
+             return True
+         elif type == "S":
++            if self.moving_clip is not None:
++                self._move_clip_cancelled = True
++                self.finish_moving_clip()
++                return True
+             if self.moving_chain:
+                 self.end_moving_chain()
+                 return True
+@@ -2513,6 +2831,9 @@ class zynthian_gui_mixer(zynthian_gui_base):
+         returns True if event is managed, False if it's not
+         """
+ 
++        if self.moving_clip is not None or self._moving_phrase_hold:
++            self.cancel_moving_clip(keep_swallow=True)
++            return True
+         if self.moving_chain:
+             self.end_moving_chain()
+             return True
+@@ -2559,8 +2880,36 @@ class zynthian_gui_mixer(zynthian_gui_base):
+             case 3:
+                 return self.switch_select(t)
+ 
++        # Always handle release of F4/S4 if a hold-move was started (even if ALT was toggled mid-hold)
++        if self.switch_i_move_clip is not None and swi == self.switch_i_move_clip and t != "P":
++            if self._move_clip_cancelled:
++                self._move_clip_cancelled = False
++                self.zyngui.zynswitch_enable_autolong()
++                return True
++            if self._moving_phrase_hold:
++                self._moving_phrase_hold = False
++                self.zyngui.zynswitch_enable_autolong()
++                self.end_moving_phrase()
++                return True
++            if self.moving_clip is not None:
++                self.zyngui.zynswitch_enable_autolong()
++                self.finish_moving_clip()
++                return True
++
+         # ALT mode + Launcher mode
+         if self.alt_mode and self.launcher_mode:
++            # Use F4 (S4 on MCP23017) to move/swap clips while held (when TTS is disabled)
++            if not self.zyngui.tts and self.switch_i_move_clip is not None and swi == self.switch_i_move_clip:
++                if t == "P":
++                    if not self.moving_chain and not self.moving_phrase and self.moving_clip is None:
++                        self.start_moving_clip()
++                    # Return False so cuia_queue records press timestamp (touch/keyboard 'R')
++                    # and does not activate auto-repeat on 'P'
++                    return False
++                elif t in ("S", "B"):
++                    return True
++            if self.moving_clip is not None:
++                return False
+             # Use F1-F2 as copy/paste buttons
+             if self.switch_i_clipboard and swi in self.switch_i_clipboard:
+                 index = self.switch_i_clipboard.index(swi)
+@@ -2843,6 +3192,24 @@ class zynthian_gui_mixer(zynthian_gui_base):
+             if self.wsled_i_add_chain is not None:
+                 wsl.set_led(leds[self.wsled_i_add_chain], wsl.wscolor_active2)
+ 
++            # Move/swap clip button (F4 in V5/Z2 when TTS is disabled)
++            if not self.zyngui.tts and self.wsled_i_move_clip is not None:
++                wsli = self.wsled_i_move_clip
++                if self.moving_clip is not None:
++                    status = self.get_move_clip_target_status()
++                    if status in ("move", "swap"):
++                        wsl.blink(leds[wsli], wsl.wscolor_active)
++                    elif status == "same":
++                        wsl.blink(leds[wsli], wsl.wscolor_active2)
++                    else:
++                        wsl.blink(leds[wsli], wsl.wscolor_red)
++                elif self._moving_phrase_hold:
++                    wsl.blink(leds[wsli], wsl.wscolor_active)
++                elif self.can_start_moving_clip():
++                    wsl.set_led(leds[wsli], wsl.wscolor_active2)
++                else:
++                    wsl.set_led(leds[wsli], wsl.wscolor_alt)
++
+     def tts_info(self, params=None):
+         if not self.zyngui.tts:
+             return
