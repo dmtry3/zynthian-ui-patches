@@ -142,7 +142,7 @@ index fa862fb..dfab0c2 100644
      # Sample loading, cropping & warping
      # ---------------------------------------------------------------
 diff --git a/zyngui/zynthian_gui_mixer.py b/zyngui/zynthian_gui_mixer.py
-index a947a9d..da86e8e 100644
+index a947a9d..37c6f0f 100644
 --- a/zyngui/zynthian_gui_mixer.py
 +++ b/zyngui/zynthian_gui_mixer.py
 @@ -25,17 +25,22 @@
@@ -298,7 +298,7 @@ index a947a9d..da86e8e 100644
              self.left_canvas.itemconfig("fader", state=tkinter.NORMAL)
              self.right_canvas.itemconfig("fader", state=tkinter.NORMAL)
              self.left_canvas.itemconfig("fader_horizontal", state=tkinter.HIDDEN)
-@@ -2471,6 +2518,672 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2471,6 +2518,683 @@ class zynthian_gui_mixer(zynthian_gui_base):
          except Exception as e:
              logging.error(e)
  
@@ -819,13 +819,24 @@ index a947a9d..da86e8e 100644
 +
 +            base_fpath = self.state_manager.get_new_capture_fpath("wav")
 +            cap_dir = os.path.dirname(base_fpath)
-+            if cap_dir:
-+                os.makedirs(cap_dir, exist_ok=True)
++            snap_fpath = getattr(self.state_manager, "last_snapshot_fpath", None) or ""
++            snap_name = splitext(basename(snap_fpath))[0].strip() if snap_fpath else ""
++            if snap_name and snap_name.lower() != "last_state":
++                project_dir = re.sub(r'[<>:"/\\|?*]+', "_", snap_name).strip(" .") or "bounce"
++            else:
++                project_dir = "bounce"
++            out_dir = os.path.join(cap_dir, project_dir) if cap_dir else project_dir
++            os.makedirs(out_dir, exist_ok=True)
 +            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", src_label).strip("_") or "bounce"
 +            stem = splitext(basename(base_fpath))[0]
++            if snap_name:
++                sanitized_snap = snap_name.replace("/", ";").replace(">", ";").replace(" ; ", ";")
++                suffix = f"_{sanitized_snap}"
++                if stem.endswith(suffix) and len(stem) > len(suffix):
++                    stem = stem[:-len(suffix)]
 +            bpm_tag = int(round(tempo))
-+            final_wav = os.path.join(cap_dir, f"{stem}_{safe_name}_{bpm_tag}bpm.wav")
-+            raw_wav = os.path.join(cap_dir, f".{stem}_{safe_name}_raw.wav")
++            final_wav = os.path.join(out_dir, f"{stem}_{safe_name}_{bpm_tag}bpm.wav")
++            raw_wav = os.path.join(out_dir, f".{stem}_{safe_name}_raw.wav")
 +
 +            self.state_manager.start_busy("bounce_clip", f"Bouncing {src_label} → {dst_label}...")
 +            self._run_on_ui_thread(lambda: self._set_bounce_title(f"Bouncing {src_label} → {dst_label}..."))
@@ -971,7 +982,7 @@ index a947a9d..da86e8e 100644
      # --------------------------------------------------------------------------
      # Physical UI Control Management: Pots & switches
      # --------------------------------------------------------------------------
-@@ -2485,6 +3198,10 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2485,6 +3209,10 @@ class zynthian_gui_mixer(zynthian_gui_base):
          if super().switch_select(type):
              return True
          elif type == "S":
@@ -982,7 +993,7 @@ index a947a9d..da86e8e 100644
              if self.moving_chain:
                  self.end_moving_chain()
                  return True
-@@ -2513,6 +3230,11 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2513,6 +3241,11 @@ class zynthian_gui_mixer(zynthian_gui_base):
          returns True if event is managed, False if it's not
          """
  
@@ -994,7 +1005,7 @@ index a947a9d..da86e8e 100644
          if self.moving_chain:
              self.end_moving_chain()
              return True
-@@ -2559,8 +3281,36 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2559,8 +3292,36 @@ class zynthian_gui_mixer(zynthian_gui_base):
              case 3:
                  return self.switch_select(t)
  
@@ -1031,7 +1042,7 @@ index a947a9d..da86e8e 100644
              # Use F1-F2 as copy/paste buttons
              if self.switch_i_clipboard and swi in self.switch_i_clipboard:
                  index = self.switch_i_clipboard.index(swi)
-@@ -2843,6 +3593,24 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2843,6 +3604,24 @@ class zynthian_gui_mixer(zynthian_gui_base):
              if self.wsled_i_add_chain is not None:
                  wsl.set_led(leds[self.wsled_i_add_chain], wsl.wscolor_active2)
  

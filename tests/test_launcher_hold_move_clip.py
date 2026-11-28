@@ -745,7 +745,10 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
         self.clippy_engine.libclippy.getFileFrames.return_value = 192000
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            self.state_manager.get_new_capture_fpath.return_value = os.path.join(tmpdir, "2026-11-28_120000.wav")
+            self.state_manager.last_snapshot_fpath = "/zynthian/zynthian-my-data/snapshots/000/001-MyProject.zss"
+            self.state_manager.get_new_capture_fpath.return_value = os.path.join(
+                tmpdir, "2026-11-28_120000_001-MyProject.wav"
+            )
 
             spawned_cmds = []
 
@@ -809,9 +812,10 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
             self.assertEqual(self.zynseq.libseq.names[(0, 0, 0)], "Bass")
             self.assertEqual(self.zynseq.libseq.repeats[(0, 0, 0)], 255)
 
-            # Target Clippy slot loaded with bounced WAV, exact beats, warp=1, name="Bass"
+            # Target Clippy slot loaded with bounced WAV in project subdir, exact beats, warp=1, name="Bass"
             loaded_file = self.proc_clp1.controllers_dict["file 2"].value
-            self.assertTrue(loaded_file.endswith("_Bass_120bpm.wav"))
+            self.assertEqual(os.path.basename(os.path.dirname(loaded_file)), "001-MyProject")
+            self.assertEqual(os.path.basename(loaded_file), "2026-11-28_120000_Bass_120bpm.wav")
             self.assertTrue(os.path.exists(loaded_file))
             self.assertEqual(self.proc_clp1.controllers_dict["beats 2"].value, 8)
             self.assertEqual(self.proc_clp1.controllers_dict["warp 2"].value, 1)
@@ -828,7 +832,10 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
         started = threading.Event()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            self.state_manager.get_new_capture_fpath.return_value = os.path.join(tmpdir, "2026-11-28_120000.wav")
+            self.state_manager.last_snapshot_fpath = "/zynthian/zynthian-my-data/snapshots/000/001-MyProject.zss"
+            self.state_manager.get_new_capture_fpath.return_value = os.path.join(
+                tmpdir, "2026-11-28_120000_001-MyProject.wav"
+            )
 
             class FakeRecProc:
                 def __init__(self, cmd):
