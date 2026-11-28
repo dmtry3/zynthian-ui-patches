@@ -18,6 +18,7 @@ def install_stubs():
     zynconf_mod.load_plain_envars = MagicMock()
     zynconf_mod.NoteCuiaDefault = {}
     zynconf_mod.get_external_storage_dirs = MagicMock(return_value=[])
+    zynconf_mod.is_service_active = MagicMock(return_value=False)
     sys.modules["zynconf"] = zynconf_mod
 
     # Stub zynautoconnect
@@ -33,6 +34,8 @@ def install_stubs():
     zyncoder_pkg = types.ModuleType("zyncoder")
     zyncore_mod = types.ModuleType("zyncoder.zyncore")
     lib_zyncore = MagicMock()
+    lib_zyncore.get_global_transpose.return_value = 0
+    lib_zyncore.get_active_midi_chan.return_value = 0
     lib_zyncore.zmop_get_num_chains.return_value = 17
     lib_zyncore.zmip_get_num_devs.return_value = 16
     lib_zyncore.zmop_get_num_devs.return_value = 16
@@ -101,6 +104,7 @@ from zyngui.zynthian_gui_control import (  # noqa: E402
     zynthian_gui_control,
 )
 from zyngui.zynthian_gui_chain_options import zynthian_gui_chain_options  # noqa: E402
+from zyngui.zynthian_gui_admin import zynthian_gui_admin  # noqa: E402
 
 
 # Load get_midi_cc_zctrls from zynthian_chain_manager without importing heavy LV2/engine backends
@@ -608,6 +612,32 @@ class TestMidiCCAutoFocus(unittest.TestCase):
         self.assertEqual(zynthian_gui_config.midi_cc_autofocus, 0)
         zynconf.save_config.assert_called_with({"ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS": "0"})
         titles_after = [item[2] for item in ch_opt.list_data]
+        self.assertIn("\u2610 MIDI Auto-Focus", titles_after)
+
+    def test_admin_menu_toggle_and_persistence(self):
+        zynthian_gui_config.midi_prog_change_zs3 = 1
+        zynthian_gui_config.midi_usb_by_port = 0
+        zynthian_gui_config.midi_chanpress_cc = 0
+
+        admin = object.__new__(zynthian_gui_admin)
+        admin.zyngui = self.zyngui
+        admin.state_manager = self.state_manager
+        admin.state_manager.allow_rbpi_headphones.return_value = False
+        admin.state_manager.update_available = False
+        admin.zyngui.screens = {}
+        admin.filling_list = False
+        admin.wifi_status = "OFF"
+        admin.wifi_index = -1
+        admin.list_data = []
+
+        admin.fill_list()
+        titles = [item[2] for item in admin.list_data]
+        self.assertIn("\u2612 MIDI Auto-Focus", titles)
+
+        admin.toggle_midi_cc_autofocus()
+        self.assertEqual(zynthian_gui_config.midi_cc_autofocus, 0)
+        zynconf.save_config.assert_called_with({"ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS": "0"})
+        titles_after = [item[2] for item in admin.list_data]
         self.assertIn("\u2610 MIDI Auto-Focus", titles_after)
 
 

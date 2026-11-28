@@ -108,6 +108,36 @@ index 8d483f4..fdd6f32 100644
      def midi_control_change(self, zmip, midi_chan, cc_num, cc_val):
          """Send MIDI CC message to relevant chain
  
+diff --git a/zyngui/zynthian_gui_admin.py b/zyngui/zynthian_gui_admin.py
+index 5ad8a27..d6a5f06 100644
+--- a/zyngui/zynthian_gui_admin.py
++++ b/zyngui/zynthian_gui_admin.py
+@@ -154,6 +154,12 @@ class zynthian_gui_admin(zynthian_gui_selector_info):
+             display_val = "NONE"
+         self.list_data.append((self.set_chanpress_cc, 0, f"Channel Pressure => CC ({display_val})",
+                                ["Map channel pressure messages (monoAT) to the selected CC.", "midi_settings.png"]))
++        if zynthian_gui_config.midi_cc_autofocus:
++            self.list_data.append((self.toggle_midi_cc_autofocus, 0, "\u2612 MIDI Auto-Focus",
++                                   ["Automatically switch to the mapped chain, processor and control page when turning a MIDI-mapped controller knob.", "midi_learn.png"]))
++        else:
++            self.list_data.append((self.toggle_midi_cc_autofocus, 0, "\u2610 MIDI Auto-Focus",
++                                   ["Do not automatically switch chain, processor or control page when turning a MIDI-mapped controller knob.", "midi_learn.png"]))
+         self.list_data.append((self.test_midi, 0, "Test MIDI",
+                                ["Play a MIDI track to test MIDI output.\n\nThis will play the MIDI through any loaded chains.", "midi_output.png"]))
+ 
+@@ -695,6 +701,12 @@ class zynthian_gui_admin(zynthian_gui_selector_info):
+         })
+         self.update_list()
+ 
++    def toggle_midi_cc_autofocus(self):
++        zynthian_gui_config.midi_cc_autofocus = int(not zynthian_gui_config.midi_cc_autofocus)
++        zynconf.save_config({"ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS": str(zynthian_gui_config.midi_cc_autofocus)})
++        logging.info(f"MIDI CC Auto-Focus {'ON' if zynthian_gui_config.midi_cc_autofocus else 'OFF'}")
++        self.update_list()
++
+     def show_cv_config(self):
+         self.zyngui.show_screen("cv_config")
+ 
 diff --git a/zyngui/zynthian_gui_chain_options.py b/zyngui/zynthian_gui_chain_options.py
 index 6534ccf..35814e3 100644
 --- a/zyngui/zynthian_gui_chain_options.py

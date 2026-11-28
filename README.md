@@ -20,15 +20,17 @@
   - Если замапленный параметр уже находится среди 4 текущих энкодеров, перерисовка не выполняется.
   - Учитывает `midi_bank_change` (CC 0 / CC 32).
 - **Быстро выключаемая опция с сохранением в конфиг:**
-  - Доступна сразу в двух меню:
-    1. **Control Options** (долгий/Bold-клик на любом энкодере на экране Control) -> `☑ MIDI Auto-Focus`
-    2. **Chain Options** (боковая панель цепи -> Chain Options) -> `☑ MIDI Auto-Focus`
+  - Доступна сразу в трёх меню:
+    1. **Admin** (секция `MIDI`) -> `☑ MIDI Auto-Focus`
+    2. **Control Options** (долгий/Bold-клик на любом энкодере на экране Control) -> `☑ MIDI Auto-Focus`
+    3. **Chain Options** (боковая панель цепи -> Chain Options) -> `☑ MIDI Auto-Focus`
   - Сохраняется в `/zynthian/config/zynthian_envars.sh` в переменную `ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS` (`1` по умолчанию, `0` — выключено).
 
 ### Затронутые файлы в `zynthian-ui`
 
 - `zyngui/zynthian_gui_config.py` — параметр `midi_cc_autofocus` (`ZYNTHIAN_UI_MIDI_CC_AUTOFOCUS`, default `1`).
 - `zyngine/zynthian_chain_manager.py` — метод `get_midi_cc_zctrls(zmip, midi_chan, cc_num)`.
+- `zyngui/zynthian_gui_admin.py` — глобальный переключатель `MIDI Auto-Focus` в меню **Admin** (секция `MIDI`).
 - `zyngui/zynthian_gui_control.py` — обработчик авто-фокуса в `cb_midi_cc`, переключение цепочки/процессора/страницы энкодеров и переключатель в Control Options.
 - `zyngui/zynthian_gui_chain_options.py` — переключатель `MIDI Auto-Focus` в Chain Options.
 
