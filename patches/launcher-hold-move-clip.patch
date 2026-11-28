@@ -1,8 +1,8 @@
 diff --git a/zyngine/zynthian_engine_clippy.py b/zyngine/zynthian_engine_clippy.py
-index fa862fb..4ddbc7f 100644
+index fa862fb..dfab0c2 100644
 --- a/zyngine/zynthian_engine_clippy.py
 +++ b/zyngine/zynthian_engine_clippy.py
-@@ -250,6 +250,95 @@ class zynthian_engine_clippy(zynthian_engine):
+@@ -250,6 +250,138 @@ class zynthian_engine_clippy(zynthian_engine):
              self.set_state_post_note(proc_to, phrase_to + 1)
              proc_to.set_state_flag = False
  
@@ -95,14 +95,81 @@ index fa862fb..4ddbc7f 100644
 +        finally:
 +            proc.set_state_flag = False
 +
++    def load_bounced_clip(self, proc, phrase, fpath, beats, name=None):
++        """ Load a bounced WAV file into a Clippy slot with exact beat/crop parameters.
++        Args:
++            proc: Clippy processor
++            phrase: Target phrase index
++            fpath: Full path to the bounced WAV file
++            beats: Exact number of beats in the bounced loop
++            name: Optional display name for the sequence
++        Returns:
++            True on success, False otherwise
++        """
++
++        note = phrase + 1
++        if not fpath or not self.set_state_pre_note(proc, note):
++            return False
++
++        self.libseq.setPlayState(self.zynseq.scene, phrase, proc.midi_chan, zynseq.SEQ_STOPPED)
++        frames = self.libclippy.getFileFrames(bytes(fpath, "utf-8"))
++        beats_val = max(1, min(int(beats), MAX_BEATS))
++        crop_end_val = frames if frames > 0 else MAX_FRAMES
++
++        proc.set_state_flag = True
++        try:
++            proc.controllers_dict[f"file {note}"].set_value(fpath)
++            proc.controllers_dict[f"crop_start {note}"].set_value(0)
++            proc.controllers_dict[f"crop_end {note}"].set_value(crop_end_val)
++            proc.controllers_dict[f"zoom {note}"].set_value(1)
++            proc.controllers_dict[f"gain {note}"].set_value(0.0)
++            proc.controllers_dict[f"warp {note}"].set_value(1)
++            proc.controllers_dict[f"beats {note}"].set_value(beats_val)
++            proc.controllers_dict[f"mode {note}"].set_value(1)
++            proc.controllers_dict[f"beat_slice {note}"].set_value(1)
++            self.set_file(proc, phrase, autoreset=False)
++            if name:
++                self.zynseq.set_sequence_param(self.zynseq.scene, phrase, proc.midi_chan, "name", name)
++                self.libseq.updateSequenceInfo()
++            return True
++        except Exception as e:
++            logging.error(f"Can't load bounced clip {fpath}: {e}")
++            return False
++        finally:
++            proc.set_state_flag = False
++
      # ---------------------------------------------------------------
      # Sample loading, cropping & warping
      # ---------------------------------------------------------------
 diff --git a/zyngui/zynthian_gui_mixer.py b/zyngui/zynthian_gui_mixer.py
-index a947a9d..5666dd6 100644
+index a947a9d..da86e8e 100644
 --- a/zyngui/zynthian_gui_mixer.py
 +++ b/zyngui/zynthian_gui_mixer.py
-@@ -214,10 +214,10 @@ class zynthian_gui_launcher_pad():
+@@ -25,17 +25,22 @@
+ # ******************************************************************************
+ 
+ 
++import os
++import re
+ import copy
++import time
+ import tkinter
+ import logging
+ #import traceback
+ from time import sleep
+ from math import log10
+-from threading import Timer
++from subprocess import Popen
++from threading import Timer, Thread, Event
+ from os.path import basename, splitext
+ from PIL import Image, ImageTk, ImageDraw, ImageFont
+ 
+ # Zynthian specific modules
++import zynautoconnect
+ from zyncoder.zyncore import lib_zyncore
+ from zynlibs.zynseq import zynseq
+ from zynlibs.zynaudioplayer import *
+@@ -214,10 +219,10 @@ class zynthian_gui_launcher_pad():
          self.canvas.move(self.timesig, dx, dy)
          self.canvas.move(self.tempo, dx, dy)
  
@@ -115,7 +182,7 @@ index a947a9d..5666dd6 100644
  
      def get_pattern_length(self, beats, bpb):
          if not bpb:
-@@ -297,6 +297,9 @@ class zynthian_gui_launcher_pad():
+@@ -297,6 +302,9 @@ class zynthian_gui_launcher_pad():
                      title = f"⇑ {name[:6]}"
                  else:
                      title = f"⇕ {name[:6]}"
@@ -125,7 +192,7 @@ index a947a9d..5666dd6 100644
              # Normal draw
              else:
                  title = name[:7]
-@@ -495,6 +498,8 @@ class zynthian_gui_launcher_pad():
+@@ -495,6 +503,8 @@ class zynthian_gui_launcher_pad():
          ts /= 1000.0
          self.gui_mixer.select_launcher(self.phrase)
          self.gui_mixer.update_active_chain(self.chain.chain_id, True)
@@ -134,17 +201,20 @@ index a947a9d..5666dd6 100644
          if ts < zynthian_gui_config.zynswitch_bold_seconds:
              self.on_clip_short_press()
          elif ts < zynthian_gui_config.zynswitch_long_seconds:
-@@ -1250,6 +1255,9 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -1250,6 +1260,12 @@ class zynthian_gui_mixer(zynthian_gui_base):
          self.highlighted_strip = None  # Highligted mixer strip object
          self.moving_chain = False  # True if moving a chain left/right
          self.moving_phrase = False # True if moving a launcher phrase up/down
 +        self.moving_clip = None    # Source clip info while holding F4/S4 to move/swap
 +        self._moving_phrase_hold = False  # True if moving_phrase was started by holding F4/S4
 +        self._move_clip_cancelled = False # True if active hold-move was cancelled before button release
++        self._bounce_thread = None        # Background worker thread for MIDI -> Clippy bounce
++        self._bounce_cancel = Event()     # Cancellation signal for active bounce
++        self._bouncing_info = None        # Active bounce metadata (src_chain_id, src_phrase, dst_chain_id, dst_phrase)
  
          # List of (strip,control) requiring gui refresh (control=None for whole strip refresh)
          self.pending_refresh_queue = set()
-@@ -1289,16 +1297,22 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -1289,16 +1305,22 @@ class zynthian_gui_mixer(zynthian_gui_base):
              self.wsleds_i_clipboard = [10, 11]
              self.switch_i_add_chain = 19
              self.wsled_i_add_chain = 12
@@ -167,7 +237,7 @@ index a947a9d..5666dd6 100644
              # Auto-enable ALT-mode to get alt. functions for S1-S4 buttons
              self.alt_mode = True
          else:
-@@ -1306,6 +1320,8 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -1306,6 +1328,8 @@ class zynthian_gui_mixer(zynthian_gui_base):
              self.wsleds_i_clipboard = None
              self.switch_i_add_chain = None
              self.wsled_i_add_chain = None
@@ -176,7 +246,7 @@ index a947a9d..5666dd6 100644
  
          self.update_layout()
          self.tts_title = "Mixer"
-@@ -1562,6 +1578,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -1562,6 +1586,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
          """ Function to handle hiding display
          """
          if self.shown:
@@ -184,7 +254,7 @@ index a947a9d..5666dd6 100644
              if not self.zyngui.osc_clients:
                  self.zyngui.state_manager.zynmixer_chan.enable_dpm(False)
                  self.zyngui.state_manager.zynmixer_bus.enable_dpm(False)
-@@ -1744,10 +1761,29 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -1744,10 +1769,31 @@ class zynthian_gui_mixer(zynthian_gui_base):
              phrase = self.zynseq.phrase
          self.left_canvas.itemconfig("launcher_pad", outline="")
          self.right_canvas.itemconfig("launcher_pad", outline="")
@@ -202,6 +272,8 @@ index a947a9d..5666dd6 100644
 +                    color = "#FF8800"
 +                elif status in ("move", "swap"):
 +                    color = "#00FF00"
++                elif status == "bounce":
++                    color = "#00CCFF"
 +                elif status == "clear":
 +                    color = "#FF4400"
 +                else:
@@ -218,7 +290,7 @@ index a947a9d..5666dd6 100644
  
          # Scroll to ensure launcher is visible - use coords relative to launcher view
          launcher_top = phrase * self.launcher_height
-@@ -2030,6 +2066,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2030,6 +2076,7 @@ class zynthian_gui_mixer(zynthian_gui_base):
                  self.zyngui.current_screen = "launcher"
              self.tts_title = "Launcher"
          else:
@@ -226,7 +298,7 @@ index a947a9d..5666dd6 100644
              self.left_canvas.itemconfig("fader", state=tkinter.NORMAL)
              self.right_canvas.itemconfig("fader", state=tkinter.NORMAL)
              self.left_canvas.itemconfig("fader_horizontal", state=tkinter.HIDDEN)
-@@ -2471,6 +2508,347 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2471,6 +2518,672 @@ class zynthian_gui_mixer(zynthian_gui_base):
          except Exception as e:
              logging.error(e)
  
@@ -303,11 +375,46 @@ index a947a9d..5666dd6 100644
 +            return self.zynseq.phrases > 1
 +        return cell[0] in ("PAT", "CLP")
 +
++    def get_chain_audio_ports(self, chain_id):
++        try:
++            chain = self.chain_manager.get_chain(chain_id)
++        except Exception:
++            chain = None
++        if chain is None or not getattr(chain, "zynmixer_proc", None):
++            return None
++        mproc = chain.zynmixer_proc
++        if getattr(mproc, "eng_code", None) == "MI":
++            base = f"zynmixer_chan:output_{mproc.mixer_chan:02d}"
++        else:
++            base = f"zynmixer_bus:output_{mproc.mixer_chan:02d}"
++        return (f"{base}a", f"{base}b")
++
++    def can_bounce_clip(self, src, dst):
++        if src is None or dst is None:
++            return False
++        if src[0] != "PAT" or not src[6] or dst[0] != "CLP":
++            return False
++        if self._bounce_thread is not None and self._bounce_thread.is_alive():
++            return False
++        if self.get_chain_audio_ports(src[4]) is None:
++            return False
++        try:
++            n_beats = int(self.zynseq.libseq.getBeatsInPattern(src[3]))
++        except Exception:
++            n_beats = 0
++        return 1 <= n_beats <= 256
++
 +    def get_move_clip_target_status(self, phrase=None):
 +        if self.moving_clip is None:
 +            return "invalid"
 +        dst = self.get_active_cell_info(phrase)
-+        if dst is None or dst[0] != self.moving_clip[0]:
++        if dst is None:
++            return "invalid"
++        if self.moving_clip[0] == "PAT" and dst[0] == "CLP":
++            if self.can_bounce_clip(self.moving_clip, dst):
++                return "bounce"
++            return "invalid"
++        if dst[0] != self.moving_clip[0]:
 +            return "invalid"
 +        src_occupied = self.moving_clip[6]
 +        if dst[0] == "PAT":
@@ -343,6 +450,16 @@ index a947a9d..5666dd6 100644
 +            elif status == "swap":
 +                dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
 +                msg = f"Swap {src_label} ↔ {dst_label}"
++            elif status == "bounce":
++                dst_label = self.get_cell_label(self.get_active_cell_info(phrase))
++                try:
++                    n_beats = int(self.zynseq.libseq.getBeatsInPattern(self.moving_clip[3]))
++                except Exception:
++                    n_beats = 0
++                if n_beats > 0:
++                    msg = f"Bounce {src_label} → {dst_label} ({n_beats}♩)"
++                else:
++                    msg = f"Bounce {src_label} → {dst_label}"
 +            else:
 +                msg = f"Can't move {src_label} here"
 +        else:
@@ -445,6 +562,11 @@ index a947a9d..5666dd6 100644
 +            return False
 +
 +        dst_label = self.get_cell_label(dst)
++        if status == "bounce":
++            if src_pad is not None:
++                src_pad.draw(force=True)
++            self.highlight_launcher()
++            return self.start_bounce_midi_to_clippy(src, dst)
 +        if status == "clear":
 +            if dst[0] == "PAT":
 +                ok = self.clear_pattern_cell(dst)
@@ -571,10 +693,285 @@ index a947a9d..5666dd6 100644
 +            logging.error(f"Can't swap audio clips: {e}")
 +            return False
 +
++    # --------------------------------------------------------------------------
++    # Bounce MIDI pattern -> Clippy audio clip (Hold F4 drag-and-drop)
++    # --------------------------------------------------------------------------
++
++    def _run_on_ui_thread(self, fn):
++        canvas = getattr(self, "right_canvas", None)
++        if canvas is not None and hasattr(canvas, "after"):
++            try:
++                canvas.after(0, fn)
++                return
++            except Exception:
++                pass
++        fn()
++
++    def _get_jack_frame_time(self):
++        jclient = getattr(zynautoconnect, "jclient", None)
++        if jclient is not None:
++            try:
++                return int(jclient.frame_time)
++            except Exception:
++                pass
++        return None
++
++    def _wait_for_jack_capture_connect(self, port_l, rec_proc, timeout=2.0):
++        jclient = getattr(zynautoconnect, "jclient", None)
++        deadline = time.monotonic() + timeout
++        if jclient is None:
++            wait_until = min(deadline, time.monotonic() + 0.25)
++            while time.monotonic() < wait_until:
++                if self._bounce_cancel.is_set() or rec_proc.poll() is not None:
++                    return False
++                sleep(0.01)
++            return rec_proc.poll() is None
++
++        while time.monotonic() < deadline:
++            if self._bounce_cancel.is_set() or rec_proc.poll() is not None:
++                return False
++            try:
++                conns = jclient.get_all_connections(port_l)
++                for conn in conns:
++                    cname = getattr(conn, "name", str(conn))
++                    if "jack_capture" in cname:
++                        return True
++            except Exception:
++                pass
++            sleep(0.005)
++        return rec_proc.poll() is None
++
++    def _trim_bounced_wav(self, raw_wav, final_wav, start_frame, exact_frames, sr):
++        try:
++            import numpy as np
++            import soundfile as sf
++
++            data, file_sr = sf.read(raw_wav, dtype="float32", always_2d=True)
++            total_frames = data.shape[0]
++            channels = data.shape[1]
++            start = max(0, min(int(start_frame), total_frames))
++            end = start + exact_frames
++            if end <= total_frames:
++                trimmed = data[start:end]
++            else:
++                avail = data[start:total_frames]
++                pad = np.zeros((exact_frames - avail.shape[0], channels), dtype=np.float32)
++                trimmed = np.vstack((avail, pad))
++            sf.write(final_wav, trimmed, file_sr or sr, subtype="PCM_24")
++            try:
++                os.remove(raw_wav)
++            except OSError:
++                pass
++            return final_wav
++        except Exception as e:
++            logging.warning(f"Bounce WAV trim fallback ({e}), using raw capture")
++            try:
++                os.replace(raw_wav, final_wav)
++                return final_wav
++            except Exception:
++                return raw_wav
++
++    def cancel_bounce_clip(self):
++        if self._bounce_thread is not None and self._bounce_thread.is_alive():
++            self._bounce_cancel.set()
++            return True
++        return False
++
++    def start_bounce_midi_to_clippy(self, src, dst):
++        if not self.can_bounce_clip(src, dst):
++            return False
++        self._bounce_cancel.clear()
++        self._bouncing_info = (src[4], src[1], dst[4], dst[1])
++        self._bounce_thread = Thread(
++            target=self._bounce_midi_worker,
++            args=(src, dst),
++            name="bounce_midi_clip",
++            daemon=True,
++        )
++        self._bounce_thread.start()
++        return True
++
++    def _bounce_midi_worker(self, src, dst):
++        scene = self.zynseq.scene
++        src_phrase, src_chan, src_pat, src_chain_id, src_label = src[1], src[2], src[3], src[4], src[5]
++        dst_phrase, dst_proc = dst[1], dst[3]
++        dst_label = self.get_cell_label(dst)
++        rec_proc = None
++        raw_wav = None
++        orig_repeat = None
++
++        try:
++            ports = self.get_chain_audio_ports(src_chain_id)
++            if not ports:
++                raise RuntimeError("Source chain has no audio output")
++            port_l, port_r = ports
++
++            n_beats = int(self.zynseq.libseq.getBeatsInPattern(src_pat))
++            if n_beats < 1:
++                raise RuntimeError("Invalid pattern length")
++
++            tempo = float(self.zynseq.libseq.getTempo() or 120.0)
++            if tempo <= 0.0:
++                tempo = 120.0
++            sr = int(zynautoconnect.get_jackd_samplerate() or 48000)
++            expected_sec = n_beats * 60.0 / tempo
++            exact_frames = max(1, int(round(expected_sec * sr)))
++
++            base_fpath = self.state_manager.get_new_capture_fpath("wav")
++            cap_dir = os.path.dirname(base_fpath)
++            if cap_dir:
++                os.makedirs(cap_dir, exist_ok=True)
++            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", src_label).strip("_") or "bounce"
++            stem = splitext(basename(base_fpath))[0]
++            bpm_tag = int(round(tempo))
++            final_wav = os.path.join(cap_dir, f"{stem}_{safe_name}_{bpm_tag}bpm.wav")
++            raw_wav = os.path.join(cap_dir, f".{stem}_{safe_name}_raw.wav")
++
++            self.state_manager.start_busy("bounce_clip", f"Bouncing {src_label} → {dst_label}...")
++            self._run_on_ui_thread(lambda: self._set_bounce_title(f"Bouncing {src_label} → {dst_label}..."))
++
++            # Stop source pattern cleanly before bounce
++            if self.zynseq.libseq.getPlayState(scene, src_phrase, src_chan) != zynseq.SEQ_STOPPED:
++                self.zynseq.libseq.setPlayState(scene, src_phrase, src_chan, zynseq.SEQ_STOPPED)
++                self.zynseq.libseq.sendMidiCommand(0xB0 | src_chan, 123, 0)
++                sleep(0.05)
++
++            orig_repeat = self.zynseq.libseq.getSequenceRepeat(scene, src_phrase, src_chan)
++            self.zynseq.libseq.setSequenceRepeat(scene, src_phrase, src_chan, 1)
++
++            cmd = [
++                "/usr/local/bin/jack_capture",
++                "--daemon",
++                "--bitdepth", "24",
++                "--bufsize", "30",
++                "--maxbufsize", "120",
++                "--port", port_l,
++                "--port", port_r,
++                raw_wav,
++            ]
++            rec_proc = Popen(cmd)
++
++            if not self._wait_for_jack_capture_connect(port_l, rec_proc, timeout=2.0):
++                if self._bounce_cancel.is_set():
++                    raise InterruptedError("Bounce cancelled")
++                raise RuntimeError("jack_capture failed to start")
++
++            # Brief pre-roll so jack_capture audio callback is streaming smoothly
++            pre_deadline = time.monotonic() + 0.10
++            while time.monotonic() < pre_deadline:
++                if self._bounce_cancel.is_set():
++                    raise InterruptedError("Bounce cancelled")
++                sleep(0.01)
++
++            f_play = self._get_jack_frame_time()
++            t_play = time.monotonic()
++            self.zynseq.libseq.setPlayState(scene, src_phrase, src_chan, zynseq.SEQ_PLAYING)
++
++            timeout_at = t_play + expected_sec + 2.0
++            while not self._bounce_cancel.is_set():
++                state = self.zynseq.libseq.getPlayState(scene, src_phrase, src_chan)
++                if state == zynseq.SEQ_STOPPED:
++                    break
++                if time.monotonic() >= timeout_at:
++                    break
++                sleep(0.01)
++
++            if self._bounce_cancel.is_set():
++                raise InterruptedError("Bounce cancelled")
++
++            # Allow last JACK audio period to flush into jack_capture
++            sleep(0.05)
++            f_end = self._get_jack_frame_time()
++            t_end = time.monotonic()
++
++            rec_proc.terminate()
++            try:
++                rec_proc.wait(timeout=5.0)
++            except Exception:
++                rec_proc.kill()
++            rec_proc = None
++
++            if not os.path.exists(raw_wav) or os.path.getsize(raw_wav) <= 44:
++                raise RuntimeError("Captured WAV file is empty")
++
++            if f_play is not None and f_end is not None:
++                captured_since_play = (f_end - f_play) & 0xFFFFFFFF
++            else:
++                captured_since_play = int(round((t_end - t_play) * sr))
++
++            try:
++                import soundfile as sf
++                total_frames = sf.info(raw_wav).frames
++            except Exception:
++                total_frames = captured_since_play
++
++            start_frame = max(0, total_frames - captured_since_play)
++            out_wav = self._trim_bounced_wav(raw_wav, final_wav, start_frame, exact_frames, sr)
++
++            ok = dst_proc.engine.load_bounced_clip(dst_proc, dst_phrase, out_wav, n_beats, name=src_label)
++            if not ok:
++                raise RuntimeError("Failed to load bounced clip into Clippy")
++
++            self.state_manager.sync = True
++
++            def on_done():
++                self.zynseq.refresh_state()
++                self.refresh_launchers(force=True)
++                self.set_title_ts = 0
++                self.set_title(f"Bounced {src_label} → {dst_label}", timeout=2.0)
++
++            self._run_on_ui_thread(on_done)
++
++        except InterruptedError:
++            logging.info(f"Bounce cancelled: {src_label} -> {dst_label}")
++            self._run_on_ui_thread(lambda: self._set_bounce_title("Bounce cancelled", timeout=1.5))
++        except Exception as e:
++            logging.error(f"Can't bounce MIDI clip {src_label} -> {dst_label}: {e}")
++            self._run_on_ui_thread(lambda: self._set_bounce_title(f"Bounce failed: {src_label}", timeout=2.0))
++        finally:
++            if rec_proc is not None:
++                try:
++                    rec_proc.terminate()
++                    rec_proc.wait(timeout=2.0)
++                except Exception:
++                    try:
++                        rec_proc.kill()
++                    except Exception:
++                        pass
++            if orig_repeat is not None:
++                try:
++                    self.zynseq.libseq.setSequenceRepeat(scene, src_phrase, src_chan, orig_repeat)
++                except Exception:
++                    pass
++            try:
++                if self.zynseq.libseq.getPlayState(scene, src_phrase, src_chan) != zynseq.SEQ_STOPPED:
++                    self.zynseq.libseq.setPlayState(scene, src_phrase, src_chan, zynseq.SEQ_STOPPED)
++                    self.zynseq.libseq.sendMidiCommand(0xB0 | src_chan, 123, 0)
++            except Exception:
++                pass
++            if raw_wav and os.path.exists(raw_wav):
++                try:
++                    os.remove(raw_wav)
++                except OSError:
++                    pass
++            self._bouncing_info = None
++            self._bounce_thread = None
++            try:
++                self.state_manager.end_busy("bounce_clip")
++            except Exception:
++                pass
++
++    def _set_bounce_title(self, msg, timeout=None):
++        self.set_title_ts = 0
++        if timeout is None:
++            self.set_title(msg)
++        else:
++            self.set_title(msg, timeout=timeout)
++
      # --------------------------------------------------------------------------
      # Physical UI Control Management: Pots & switches
      # --------------------------------------------------------------------------
-@@ -2485,6 +2863,10 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2485,6 +3198,10 @@ class zynthian_gui_mixer(zynthian_gui_base):
          if super().switch_select(type):
              return True
          elif type == "S":
@@ -585,17 +982,19 @@ index a947a9d..5666dd6 100644
              if self.moving_chain:
                  self.end_moving_chain()
                  return True
-@@ -2513,6 +2895,9 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2513,6 +3230,11 @@ class zynthian_gui_mixer(zynthian_gui_base):
          returns True if event is managed, False if it's not
          """
  
 +        if self.moving_clip is not None or self._moving_phrase_hold:
 +            self.cancel_moving_clip(keep_swallow=True)
 +            return True
++        if self.cancel_bounce_clip():
++            return True
          if self.moving_chain:
              self.end_moving_chain()
              return True
-@@ -2559,8 +2944,36 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2559,8 +3281,36 @@ class zynthian_gui_mixer(zynthian_gui_base):
              case 3:
                  return self.switch_select(t)
  
@@ -632,7 +1031,7 @@ index a947a9d..5666dd6 100644
              # Use F1-F2 as copy/paste buttons
              if self.switch_i_clipboard and swi in self.switch_i_clipboard:
                  index = self.switch_i_clipboard.index(swi)
-@@ -2843,6 +3256,24 @@ class zynthian_gui_mixer(zynthian_gui_base):
+@@ -2843,6 +3593,24 @@ class zynthian_gui_mixer(zynthian_gui_base):
              if self.wsled_i_add_chain is not None:
                  wsl.set_led(leds[self.wsled_i_add_chain], wsl.wscolor_active2)
  
@@ -641,7 +1040,7 @@ index a947a9d..5666dd6 100644
 +                wsli = self.wsled_i_move_clip
 +                if self.moving_clip is not None:
 +                    status = self.get_move_clip_target_status()
-+                    if status in ("move", "swap", "clear"):
++                    if status in ("move", "swap", "clear", "bounce"):
 +                        wsl.blink(leds[wsli], wsl.wscolor_active)
 +                    elif status in ("same", "noop"):
 +                        wsl.blink(leds[wsli], wsl.wscolor_active2)

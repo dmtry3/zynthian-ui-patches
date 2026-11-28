@@ -3,9 +3,11 @@
 
 import os
 import sys
+import tempfile
+import threading
 import types
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 ZYNTHIAN_UI_DIR = os.environ.get("ZYNTHIAN_UI_DIR", "/zynthian/zynthian-ui")
 
@@ -169,12 +171,24 @@ class FakeLibSeq:
         self.repeats = {}
         # (scene, phrase, chan) -> play_state
         self.play_states = {}
+        # pattern_id -> beats
+        self.pattern_beats = {}
+        self.tempo = 120.0
         self.midi_commands = []
         self.cleared_patterns = []
         self.update_info_calls = 0
 
     def getPattern(self, scene, phrase, chan, track, pos):
         return self.patterns.get((scene, phrase, chan), 0xFFFFFFFF)
+
+    def getBeatsInPattern(self, pat):
+        return self.pattern_beats.get(pat, 4)
+
+    def getTempo(self):
+        return self.tempo
+
+    def setSequenceRepeat(self, scene, phrase, chan, repeat):
+        self.repeats[(scene, phrase, chan)] = repeat
 
     def removePattern(self, scene, phrase, chan, track, pos):
         self.patterns.pop((scene, phrase, chan), None)
@@ -254,10 +268,14 @@ class FakePad:
 
 
 class FakeChain:
-    def __init__(self, chain_id, midi_chan, processors=None):
+    def __init__(self, chain_id, midi_chan, processors=None, mixer_chan=None):
         self.chain_id = chain_id
         self.midi_chan = midi_chan
         self._processors = processors or []
+        if mixer_chan is not None:
+            self.zynmixer_proc = types.SimpleNamespace(eng_code="MI", mixer_chan=mixer_chan)
+        else:
+            self.zynmixer_proc = None
 
     def get_processors(self):
         return self._processors
@@ -287,6 +305,10 @@ class FakeClippyEngine(zynthian_engine_clippy):
         phrase = note - 1
         self.set_file_calls.append((processor, phrase, processor.controllers_dict[f"file {note}"].value))
         return True
+
+    def set_file(self, processor, phrase, autoreset=True):
+        note = phrase + 1
+        self.set_file_calls.append((processor, phrase, processor.controllers_dict[f"file {note}"].value))
 
 
 def make_clippy_proc(engine, midi_chan, phrases=4, clip_files=None):
@@ -351,10 +373,10 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
             {1: {"file": "/clips/loop2.wav", "gain": 2.5, "beats": 16, "crop_start": 500, "crop_end": 96000}},
         )
 
-        self.chain_midi1 = FakeChain(1, 0)
-        self.chain_midi2 = FakeChain(2, 1)
-        self.chain_clp1 = FakeChain(3, 16, [self.proc_clp1])
-        self.chain_clp2 = FakeChain(4, 17, [self.proc_clp2])
+        self.chain_midi1 = FakeChain(1, 0, mixer_chan=0)
+        self.chain_midi2 = FakeChain(2, 1, mixer_chan=1)
+        self.chain_clp1 = FakeChain(3, 16, [self.proc_clp1], mixer_chan=2)
+        self.chain_clp2 = FakeChain(4, 17, [self.proc_clp2], mixer_chan=3)
         self.chain_main = FakeChain(0, None)
 
         self.chains = [self.chain_midi1, self.chain_midi2, self.chain_clp1, self.chain_clp2, self.chain_main]
@@ -362,6 +384,9 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
 
         self.chain_manager = MagicMock()
         self.chain_manager.get_active_chain.side_effect = lambda: self.active_chain
+        self.chain_manager.get_chain.side_effect = lambda cid: next(
+            (c for c in self.chains if c.chain_id == cid), None
+        )
 
         self.state_manager = MagicMock()
         self.wsleds = types.SimpleNamespace(
@@ -390,6 +415,9 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
         self.mixer.moving_clip = None
         self.mixer._moving_phrase_hold = False
         self.mixer._move_clip_cancelled = False
+        self.mixer._bounce_thread = None
+        self.mixer._bounce_cancel = threading.Event()
+        self.mixer._bouncing_info = None
         self.mixer.param_editor_zctrl = None
         self.mixer.clipboard = [None, None, None, None]
         self.mixer.switch_i_clipboard = [11, 15]
@@ -400,6 +428,7 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
         self.mixer.wsled_i_move_clip = 13
         self.mixer.left_canvas = MagicMock()
         self.mixer.right_canvas = MagicMock()
+        self.mixer.right_canvas.after = lambda delay, fn, *args: fn(*args)
         self.mixer.launcher_height = 50
         self.mixer.fader_height = 300
         self.mixer.legend_y = 350
@@ -487,15 +516,40 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
 
     def test_hold_f4_incompatible_target_cancels_without_changes(self):
         self.mixer.switch(23, "P")
-        # Move MIDI pattern over Clippy audio chain -> invalid
-        self.move_cursor(2, 0)
+        # Move MIDI pattern over Main / Phrase column -> invalid
+        self.move_cursor(4, 0)
         self.assertEqual(self.mixer.get_move_clip_target_status(), "invalid")
-        self.assertEqual(self.mixer.chain_strips[2].launchers[0].outline, "#FF0000")
+        self.assertEqual(self.mixer.chain_strips[4].launchers[0].outline, "#FF0000")
 
         self.assertTrue(self.mixer.switch(23, "B"))
         self.assertEqual(self.zynseq.libseq.patterns[(0, 0, 0)], 101)
         self.assertEqual(self.zynseq.refresh_calls, 0)
         self.zyngui.zynswitch_enable_autolong.assert_called_once()
+
+        # Clippy audio clip over MIDI pattern -> invalid
+        self.zyngui.zynswitch_enable_autolong.reset_mock()
+        self.move_cursor(2, 0)
+        self.mixer.switch(23, "P")
+        self.move_cursor(0, 0)
+        self.assertEqual(self.mixer.get_move_clip_target_status(), "invalid")
+        self.assertEqual(self.mixer.chain_strips[0].launchers[0].outline, "#FF0000")
+        self.assertTrue(self.mixer.switch(23, "B"))
+        self.assertEqual(self.proc_clp1.controllers_dict["file 1"].value, "/clips/loop1.wav")
+
+        # Empty MIDI cell over Clippy -> invalid (no bounce of empty pattern)
+        self.move_cursor(0, 1)
+        self.mixer.switch(23, "P")
+        self.move_cursor(2, 1)
+        self.assertEqual(self.mixer.get_move_clip_target_status(), "invalid")
+        self.assertTrue(self.mixer.switch(23, "B"))
+
+        # MIDI chain without audio mixer output over Clippy -> invalid
+        self.chain_midi1.zynmixer_proc = None
+        self.move_cursor(0, 0)
+        self.mixer.switch(23, "P")
+        self.move_cursor(2, 1)
+        self.assertEqual(self.mixer.get_move_clip_target_status(), "invalid")
+        self.assertTrue(self.mixer.switch(23, "B"))
 
     def test_hold_f4_release_on_same_cell_is_noop(self):
         self.mixer.switch(23, "P")
@@ -672,10 +726,157 @@ class TestLauncherHoldMoveClip(unittest.TestCase):
         self.mixer.update_wsleds(leds)
         self.wsleds.blink.assert_called_with(13, "GREEN")
 
+        # Moving occupied MIDI pattern over Clippy -> bounce (blink green)
         self.move_cursor(2, 0)
         self.wsleds.blink.reset_mock()
         self.mixer.update_wsleds(leds)
+        self.wsleds.blink.assert_called_with(13, "GREEN")
+
+        # Moving MIDI pattern over Main / Phrase -> invalid (blink red)
+        self.move_cursor(4, 0)
+        self.wsleds.blink.reset_mock()
+        self.mixer.update_wsleds(leds)
         self.wsleds.blink.assert_called_with(13, "RED")
+
+    def test_hold_f4_bounce_midi_pattern_to_clippy_slot(self):
+        # Source: Chain 1 (MIDI ch 0, mixer_chan 0), phrase 0 ("Bass", pat 101, repeat=255, 8 beats)
+        self.zynseq.libseq.repeats[(0, 0, 0)] = 255
+        self.zynseq.libseq.pattern_beats[101] = 8
+        self.clippy_engine.libclippy.getFileFrames.return_value = 192000
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.state_manager.get_new_capture_fpath.return_value = os.path.join(tmpdir, "2026-11-28_120000.wav")
+
+            spawned_cmds = []
+
+            class FakeRecProc:
+                def __init__(self, cmd):
+                    spawned_cmds.append(cmd)
+                    self.wav_path = cmd[-1]
+                    self.terminated = False
+                    # Write dummy WAV > 44 bytes so size check passes
+                    with open(self.wav_path, "wb") as f:
+                        f.write(b"RIFF" + b"\x00" * 128)
+
+                def poll(self):
+                    return 0 if self.terminated else None
+
+                def terminate(self):
+                    self.terminated = True
+
+                def wait(self, timeout=None):
+                    return 0
+
+                def kill(self):
+                    self.terminated = True
+
+            # Auto-stop playback immediately after SEQ_PLAYING is set
+            orig_set_play_state = self.zynseq.libseq.setPlayState
+
+            def auto_finish_play(scene, phrase, chan, state):
+                if state == zynseq_const.SEQ_PLAYING:
+                    orig_set_play_state(scene, phrase, chan, zynseq_const.SEQ_STOPPED)
+                else:
+                    orig_set_play_state(scene, phrase, chan, state)
+
+            self.zynseq.libseq.setPlayState = auto_finish_play
+
+            with patch("zyngui.zynthian_gui_mixer.Popen", side_effect=FakeRecProc), \
+                 patch("zyngui.zynthian_gui_mixer.sleep", return_value=None), \
+                 patch.object(self.mixer, "_wait_for_jack_capture_connect", return_value=True):
+                # Hold F4 on MIDI pattern A1 ("Bass")
+                self.assertFalse(self.mixer.switch(23, "P"))
+                # Move cursor to empty Clippy slot Chain 3, phrase 1
+                self.move_cursor(2, 1)
+                self.assertEqual(self.mixer.get_move_clip_target_status(), "bounce")
+                self.assertEqual(self.mixer.chain_strips[2].launchers[1].outline, "#00CCFF")
+                self.assertIn("Bounce Bass → Q2 (8♩)", [t[0] for t in self.mixer.titles])
+
+                # Release F4 -> starts bounce worker
+                self.assertTrue(self.mixer.switch(23, "B"))
+                worker = self.mixer._bounce_thread
+                self.assertIsNotNone(worker)
+                worker.join(timeout=5.0)
+
+            # Verify jack_capture captured isolated synth mixer channel ports
+            self.assertEqual(len(spawned_cmds), 1)
+            self.assertIn("zynmixer_chan:output_00a", spawned_cmds[0])
+            self.assertIn("zynmixer_chan:output_00b", spawned_cmds[0])
+
+            # Source MIDI pattern is completely untouched (pattern, name, repeat restored)
+            self.assertEqual(self.zynseq.libseq.patterns[(0, 0, 0)], 101)
+            self.assertFalse(self.zynseq.libseq.empty_patterns[101])
+            self.assertEqual(self.zynseq.libseq.names[(0, 0, 0)], "Bass")
+            self.assertEqual(self.zynseq.libseq.repeats[(0, 0, 0)], 255)
+
+            # Target Clippy slot loaded with bounced WAV, exact beats, warp=1, name="Bass"
+            loaded_file = self.proc_clp1.controllers_dict["file 2"].value
+            self.assertTrue(loaded_file.endswith("_Bass_120bpm.wav"))
+            self.assertTrue(os.path.exists(loaded_file))
+            self.assertEqual(self.proc_clp1.controllers_dict["beats 2"].value, 8)
+            self.assertEqual(self.proc_clp1.controllers_dict["warp 2"].value, 1)
+            self.assertEqual(self.proc_clp1.controllers_dict["beat_slice 2"].value, 1)
+            self.assertEqual(self.proc_clp1.controllers_dict["crop_start 2"].value, 0)
+            self.assertEqual(self.proc_clp1.controllers_dict["crop_end 2"].value, 192000)
+            self.assertFalse(self.proc_clp1.set_state_flag)
+            self.assertEqual(self.zynseq.libseq.names[(0, 1, 16)], "Bass")
+            self.assertEqual(self.mixer.titles[-1], ("Bounced Bass → Q2", 2.0))
+            self.assertTrue(self.state_manager.sync)
+
+    def test_back_cancels_active_bounce_and_restores_source_repeat(self):
+        self.zynseq.libseq.repeats[(0, 0, 0)] = 4
+        started = threading.Event()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.state_manager.get_new_capture_fpath.return_value = os.path.join(tmpdir, "2026-11-28_120000.wav")
+
+            class FakeRecProc:
+                def __init__(self, cmd):
+                    self.wav_path = cmd[-1]
+                    self.terminated = False
+                    with open(self.wav_path, "wb") as f:
+                        f.write(b"RIFF" + b"\x00" * 64)
+
+                def poll(self):
+                    return 0 if self.terminated else None
+
+                def terminate(self):
+                    self.terminated = True
+
+                def wait(self, timeout=None):
+                    return 0
+
+                def kill(self):
+                    self.terminated = True
+
+            orig_set_play_state = self.zynseq.libseq.setPlayState
+
+            def track_play(scene, phrase, chan, state):
+                orig_set_play_state(scene, phrase, chan, state)
+                if state == zynseq_const.SEQ_PLAYING:
+                    started.set()
+
+            self.zynseq.libseq.setPlayState = track_play
+
+            with patch("zyngui.zynthian_gui_mixer.Popen", side_effect=FakeRecProc), \
+                 patch.object(self.mixer, "_wait_for_jack_capture_connect", return_value=True):
+                self.mixer.switch(23, "P")
+                self.move_cursor(2, 1)
+                self.mixer.switch(23, "B")
+                self.assertTrue(started.wait(timeout=3.0))
+
+                # Press BACK during bounce
+                self.assertTrue(self.mixer.back_action())
+                worker = self.mixer._bounce_thread
+                if worker is not None:
+                    worker.join(timeout=5.0)
+
+            # Original repeat restored, playback stopped with All Notes Off, target Clippy slot untouched
+            self.assertEqual(self.zynseq.libseq.repeats[(0, 0, 0)], 4)
+            self.assertEqual(self.zynseq.libseq.play_states[(0, 0, 0)], zynseq_const.SEQ_STOPPED)
+            self.assertIn((0xB0, 123, 0), self.zynseq.libseq.midi_commands)
+            self.assertEqual(self.proc_clp1.controllers_dict["file 2"].value, "")
+            self.assertEqual(self.mixer.titles[-1], ("Bounce cancelled", 1.5))
 
     def test_hide_cancels_move_and_reenables_autolong(self):
         self.mixer.switch(23, "P")
